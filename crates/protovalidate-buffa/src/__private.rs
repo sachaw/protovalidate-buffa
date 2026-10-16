@@ -2,6 +2,26 @@
 
 use std::borrow::Borrow;
 
+use crate::ValidationError;
+
+/// Validation for a message from another module, copied into a generated
+/// file.
+///
+/// When a generated message embeds a message whose file is not being
+/// generated (for example a type from a dependency module), the plugin copies
+/// that message's rules into the same file as impls of this trait, keyed by
+/// the file's validator-set marker. Nested validation then never depends on
+/// another validator crate. Keeping the copies off [`crate::Validate`] means
+/// they can never make a user's `validate()` call ambiguous.
+pub trait Embedded<Set> {
+    /// Runs every rule attached to this message and its nested messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ValidationError`] as [`crate::Validate::validate`] does.
+    fn validate(&self) -> Result<(), ValidationError>;
+}
+
 /// A zero-allocation, last-write-wins adapter over a protobuf map view.
 ///
 /// Buffa's [`buffa::MapView`] retains duplicate wire entries. Validation must
