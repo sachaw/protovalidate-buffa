@@ -1,0 +1,37 @@
+[package]
+name = "protovalidate-buffa-separate-crate-app-validate"
+version = "0.0.0"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Validators for app.v1, generated into their own crate; depends on the geo.v1 types but not on its validators."
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[lib]
+name = "app_validate"
+
+[dependencies]
+app-types = { package = "protovalidate-buffa-separate-crate-app-types", path = "../app-types" }
+buffa = "0.9.1"
+geo-types = { package = "protovalidate-buffa-separate-crate-geo-types", path = "../geo-types" }
+protovalidate-buffa = { path = "../../../crates/protovalidate-buffa", version = "0.7.2", default-features = false }
+
+[dev-dependencies]
+connectrpc = { version = "0.9", default-features = false }
+geo-validate = { package = "protovalidate-buffa-separate-crate-geo-validate", path = "../geo-validate" }
+protovalidate-buffa = { path = "../../../crates/protovalidate-buffa", version = "0.7.2", default-features = false, features = ["connect"] }
+trybuild = "1"
+
+[build-dependencies]
+anyhow = "1"
+buffa = "0.9.1"
+buffa-codegen = "0.9.1"
+protoc-gen-protovalidate-buffa = { path = "../../../crates/protoc-gen-protovalidate-buffa", version = "0.10.4" }
+
+[lints]
+workspace = true

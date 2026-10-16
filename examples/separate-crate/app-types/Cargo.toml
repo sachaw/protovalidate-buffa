@@ -1,0 +1,29 @@
+[package]
+name = "protovalidate-buffa-separate-crate-app-types"
+version = "0.0.0"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Buffa types for the example app.v1 module, which imports geo.v1."
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[lib]
+name = "app_types"
+
+[dependencies]
+buffa = "0.9.1"
+geo-types = { package = "protovalidate-buffa-separate-crate-geo-types", path = "../geo-types" }
+
+[build-dependencies]
+anyhow = "1"
+buffa = "0.9.1"
+buffa-codegen = "0.9.1"
+protoc-gen-protovalidate-buffa = { path = "../../../crates/protoc-gen-protovalidate-buffa", version = "0.10.4" }
+
+[lints]
+workspace = true

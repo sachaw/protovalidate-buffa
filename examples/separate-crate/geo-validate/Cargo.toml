@@ -1,0 +1,30 @@
+[package]
+name = "protovalidate-buffa-separate-crate-geo-validate"
+version = "0.0.0"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Validators for geo.v1, generated into their own crate."
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[lib]
+name = "geo_validate"
+
+[dependencies]
+buffa = "0.9.1"
+geo-types = { package = "protovalidate-buffa-separate-crate-geo-types", path = "../geo-types" }
+protovalidate-buffa = { path = "../../../crates/protovalidate-buffa", version = "0.7.2", default-features = false }
+
+[build-dependencies]
+anyhow = "1"
+buffa = "0.9.1"
+buffa-codegen = "0.9.1"
+protoc-gen-protovalidate-buffa = { path = "../../../crates/protoc-gen-protovalidate-buffa", version = "0.10.4" }
+
+[lints]
+workspace = true

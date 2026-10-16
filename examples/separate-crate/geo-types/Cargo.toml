@@ -1,0 +1,28 @@
+[package]
+name = "protovalidate-buffa-separate-crate-geo-types"
+version = "0.0.0"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Buffa types for the example geo.v1 dependency module, shaped like a registry SDK crate."
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[lib]
+name = "geo_types"
+
+[dependencies]
+buffa = "0.9.1"
+
+[build-dependencies]
+anyhow = "1"
+buffa = "0.9.1"
+buffa-codegen = "0.9.1"
+protoc-gen-protovalidate-buffa = { path = "../../../crates/protoc-gen-protovalidate-buffa", version = "0.10.4" }
+
+[lints]
+workspace = true

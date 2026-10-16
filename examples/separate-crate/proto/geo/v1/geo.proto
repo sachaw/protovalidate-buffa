@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package geo.v1;
+
+import "buf/validate/validate.proto";
+
+// A dependency module: its validators are generated into their own crate,
+// and app.v1's validators embed copies of the rules they need.
+message GeoPoint {
+  message Accuracy {
+    double meters = 1 [(buf.validate.field).double.gt = 0];
+  }
+
+  double lat = 1 [(buf.validate.field).double = {
+    gte: -90
+    lte: 90
+  }];
+  double lon = 2 [(buf.validate.field).double = {
+    gte: -180
+    lte: 180
+  }];
+  Accuracy accuracy = 3;
+}
+
+// Referenced by app.v1 but carries no rules: nothing is embedded for it.
+message Label {
+  string text = 1;
+}
+
+// Carries rules but app.v1 never references it: nothing is embedded for it.
+message Unrelated {
+  string id = 1 [(buf.validate.field).string.min_len = 1];
+}

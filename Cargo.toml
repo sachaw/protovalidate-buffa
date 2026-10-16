@@ -7,6 +7,10 @@ members = [
   "crates/protovalidate-buffa-macros",
   "crates/protovalidate-buffa-protos",
   "examples/packaging",
+  "examples/separate-crate/app-types",
+  "examples/separate-crate/app-validate",
+  "examples/separate-crate/geo-types",
+  "examples/separate-crate/geo-validate",
 ]
 
 [workspace.package]
