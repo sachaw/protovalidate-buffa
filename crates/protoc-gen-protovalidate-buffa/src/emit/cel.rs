@@ -24,16 +24,15 @@ use crate::{
 ///
 /// Returns `(statics, calls)` — statics go outside the impl block, calls go
 /// inside the `validate` body after field/oneof blocks.
-#[must_use]
 pub(crate) fn emit_message_level(
     msg: &MessageValidators,
-    schemas: &SchemaIndex,
+    scope: &crate::emit::Scope<'_>,
     shape: crate::emit::Shape,
-) -> (Vec<TokenStream>, Vec<TokenStream>) {
+) -> anyhow::Result<(Vec<TokenStream>, Vec<TokenStream>)> {
     let statics = Vec::new();
     let mut calls = Vec::new();
-    let mut msg_schema = build_message_schema(msg);
-    let mut shaped_schemas = schemas.clone();
+    let mut msg_schema = build_message_schema(msg, scope.types, scope.package)?;
+    let mut shaped_schemas = scope.schemas.clone();
     if matches!(shape, crate::emit::Shape::View) {
         for schema in std::iter::once(&mut msg_schema).chain(shaped_schemas.values_mut()) {
             for entry in &mut schema.fields {
@@ -222,7 +221,7 @@ pub(crate) fn emit_message_level(
             calls.push(guard_ignored_zero_value(f, &field_ident, call));
         }
     }
-    (statics, calls)
+    Ok((statics, calls))
 }
 
 // https://github.com/mathematic-inc/protovalidate-buffa/discussions/84
@@ -708,12 +707,23 @@ fn field_this_access(
 pub type SchemaIndex = std::collections::BTreeMap<String, MessageSchema>;
 
 /// Build the `SchemaIndex` for emitted messages and the FieldMask well-known type.
-#[must_use]
-pub fn build_schema_index(messages: &[MessageValidators]) -> SchemaIndex {
+///
+/// Oneof paths are resolved relative to `package`, the package of the file
+/// being generated.
+pub(crate) fn build_schema_index(
+    messages: &[MessageValidators],
+    types: &crate::emit::types::Types<'_>,
+    package: &str,
+) -> anyhow::Result<SchemaIndex> {
     let mut index: SchemaIndex = messages
         .iter()
-        .map(|m| (m.proto_name.clone(), build_message_schema(m)))
-        .collect();
+        .map(|m| {
+            Ok((
+                m.proto_name.clone(),
+                build_message_schema(m, types, package)?,
+            ))
+        })
+        .collect::<anyhow::Result<_>>()?;
     // FieldMask retains its protobuf message shape in CEL, but its imported
     // descriptor is not normally among the messages being emitted.
     index
@@ -726,7 +736,7 @@ pub fn build_schema_index(messages: &[MessageValidators]) -> SchemaIndex {
                 kind: SchemaFieldKind::Repeated,
             }],
         });
-    index
+    Ok(index)
 }
 
 /// Try the message-typed `this` shape: when `(field).cel` targets a
@@ -1051,7 +1061,16 @@ pub(crate) fn this_binding_for_kind_with(
 
 /// Build a schema describing every top-level proto field of a message,
 /// suitable for the transpiler's `Message` binding.
-fn build_message_schema(msg: &MessageValidators) -> MessageSchema {
+fn build_message_schema(
+    msg: &MessageValidators,
+    types: &crate::emit::types::Types<'_>,
+    package: &str,
+) -> anyhow::Result<MessageSchema> {
+    let root = if msg.oneof_rules.is_empty() {
+        String::new()
+    } else {
+        types.package_root(&msg.proto_name, package)?
+    };
     let fields = msg
         .field_rules
         .iter()
@@ -1066,6 +1085,7 @@ fn build_message_schema(msg: &MessageValidators) -> MessageSchema {
             }) {
                 entry.kind = SchemaFieldKind::Oneof {
                     accessor: oneof.rust_name.clone(),
+                    root: root.clone(),
                     parent_msg_name: oneof.parent_msg_name.clone(),
                     enumeration: super::oneof::to_pascal_case(&oneof.name),
                     variant: super::oneof::to_pascal_case(&field.field_name),
@@ -1075,7 +1095,7 @@ fn build_message_schema(msg: &MessageValidators) -> MessageSchema {
             Some(entry)
         })
         .collect();
-    MessageSchema { fields }
+    Ok(MessageSchema { fields })
 }
 
 fn field_to_schema_entry(f: &FieldValidator) -> Option<MessageFieldEntry> {

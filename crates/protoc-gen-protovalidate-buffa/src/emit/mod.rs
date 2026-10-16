@@ -1,8 +1,13 @@
 //! Orchestrate the emit phase: group scanned validators by source `.proto`
 //! file or package, with optional module packaging.
 
+use std::collections::BTreeMap;
+
 use anyhow::Result;
-use buffa_codegen::generated::compiler::code_generator_response::File;
+use buffa_codegen::generated::{
+    compiler::{CodeGeneratorRequest, code_generator_response::File},
+    descriptor::FileDescriptorProto,
+};
 use proc_macro2::TokenStream;
 use quote::quote;
 
@@ -42,6 +47,17 @@ pub struct Options {
     pub file_per_package: bool,
 }
 
+impl Options {
+    /// The `extern_path` mappings type resolution runs with.
+    fn effective_extern_paths(&self) -> Vec<(String, String)> {
+        if self.packaging {
+            vec![(".".to_string(), self.proto_module.clone())]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 impl Default for Options {
     fn default() -> Self {
         Self {
@@ -57,6 +73,7 @@ pub mod cel_compile;
 pub mod field;
 pub mod oneof;
 pub mod repeated;
+pub(crate) mod types;
 
 /// Generated message representation targeted by a validation body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +96,87 @@ impl Shape {
                 quote! { (&#binding) }
             }
         }
+    }
+}
+
+/// What the field emitters need to know about the file being generated.
+pub(crate) struct Scope<'a> {
+    pub(crate) schemas: &'a cel::SchemaIndex,
+    types: &'a types::Types<'a>,
+    /// Protobuf package of the file; relative type paths start here.
+    package: &'a str,
+}
+
+impl Scope<'_> {
+    /// The Rust type a message-typed value has in `shape`.
+    pub(crate) fn message_type(&self, full_name: &str, shape: Shape) -> Result<TokenStream> {
+        match shape {
+            Shape::Owned => self.types.owned(full_name, self.package),
+            Shape::View => self.types.view(full_name, self.package),
+        }
+    }
+
+    /// The Rust enum type for `full_name`.
+    pub(crate) fn enum_type(&self, full_name: &str) -> Result<TokenStream> {
+        self.types.owned(full_name, self.package)
+    }
+
+    /// The module holding the oneof enums of message `full_name`
+    /// (`<package root>::__buffa::[view::]oneof::<message path>`).
+    pub(crate) fn oneof_module(
+        &self,
+        full_name: &str,
+        package: &str,
+        shape: Shape,
+    ) -> Result<TokenStream> {
+        let root = self.types.package_root(full_name, self.package)?;
+        Ok(oneof_module(&root, package, full_name, shape))
+    }
+
+    /// The expression validating nested message `value` of type `full_name`,
+    /// or `None` when the type has no generated validator (well-known types).
+    pub(crate) fn nested_validate(
+        &self,
+        full_name: &str,
+        shape: Shape,
+        value: &TokenStream,
+    ) -> Result<Option<TokenStream>> {
+        if full_name.starts_with("google.protobuf.") {
+            return Ok(None);
+        }
+        let ty = self.message_type(full_name, shape)?;
+        Ok(Some(quote! {
+            <#ty as ::protovalidate_buffa::Validate>::validate(#value)
+        }))
+    }
+}
+
+/// The oneof-enum module for message `full_name` in `package`, whose package
+/// module is reached through `root` (empty for the current module).
+pub(crate) fn oneof_module(
+    root: &str,
+    package: &str,
+    full_name: &str,
+    shape: Shape,
+) -> TokenStream {
+    let within = if package.is_empty() {
+        full_name
+    } else {
+        full_name
+            .strip_prefix(package)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .unwrap_or(full_name)
+    };
+    let module = oneof::module_path(within);
+    let kind = match shape {
+        Shape::Owned => quote! { __buffa::oneof },
+        Shape::View => quote! { __buffa::view::oneof },
+    };
+    if root.is_empty() {
+        quote! { #kind::#module }
+    } else {
+        let root = buffa_codegen::idents::rust_path_to_tokens(root);
+        quote! { #root::#kind::#module }
     }
 }
 
@@ -138,11 +236,15 @@ pub(crate) fn field_ident(name: &str) -> proc_macro2::Ident {
 ///
 /// Output path: `"example/v1/foo.proto"` → `"example.v1.foo.rs"`.
 ///
+/// Without descriptors, type paths follow protobuf naming conventions:
+/// packages are the lowercase leading segments and nested types live in
+/// snake_case modules. Use [`render_request`] to resolve them against the
+/// request's descriptors instead.
+///
 /// # Errors
 ///
-/// Returns an error if any message's Rust path cannot be parsed, if a field
-/// emitter fails (e.g. unsupported enum nesting), or if `prettyplease`
-/// cannot format the generated `TokenStream`.
+/// Returns an error if a type path cannot be resolved, if a field emitter
+/// fails, or if `prettyplease` cannot format the generated `TokenStream`.
 pub fn render(messages: &[MessageValidators]) -> Result<Vec<File>> {
     render_with_options(messages, &Options::default())
 }
@@ -165,9 +267,43 @@ pub fn render(messages: &[MessageValidators]) -> Result<Vec<File>> {
 ///
 /// See [`render`].
 pub fn render_with_options(messages: &[MessageValidators], opts: &Options) -> Result<Vec<File>> {
-    use std::collections::BTreeMap;
+    let (files, to_generate) = types::synthesize_descriptors(messages);
+    render_set(&files, &to_generate, messages, opts)
+}
 
-    let schemas = cel::build_schema_index(messages);
+/// Scan `request` and render its validators, resolving every type path
+/// against the request's descriptors exactly as buffa does.
+///
+/// This is what the plugin binary runs. Prefer it over [`render_with_options`]
+/// for in-process generation: [`render_with_options`] has no descriptors and
+/// derives paths from protobuf names instead.
+///
+/// # Errors
+///
+/// Returns an error if scanning fails (see [`crate::scan::gather`]), if a
+/// referenced type is missing from the request, or for the reasons listed on
+/// [`render`].
+pub fn render_request(request: &CodeGeneratorRequest, opts: &Options) -> Result<Vec<File>> {
+    let messages = crate::scan::gather(request)?;
+    render_set(
+        &request.proto_file,
+        &request.file_to_generate,
+        &messages,
+        opts,
+    )
+}
+
+/// Render validators for `messages`, resolving type paths against `files`.
+fn render_set(
+    descriptors: &[FileDescriptorProto],
+    to_generate: &[String],
+    messages: &[MessageValidators],
+    opts: &Options,
+) -> Result<Vec<File>> {
+    let mut config = buffa_codegen::CodeGenConfig::default();
+    config.extern_paths = opts.effective_extern_paths();
+    let types = types::Types::new(descriptors, to_generate, &config, false);
+
     let mut groups: BTreeMap<&str, Vec<&MessageValidators>> = BTreeMap::new();
     for m in messages {
         let key = if opts.file_per_package {
@@ -184,7 +320,14 @@ pub fn render_with_options(messages: &[MessageValidators], opts: &Options) -> Re
     // file under the right `pub mod` nesting.
     let mut by_package: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (key, msgs) in groups {
-        let body = render_file(&msgs, &schemas)?;
+        let package = msgs.first().map_or("", |m| m.package.as_str());
+        let schemas = cel::build_schema_index(messages, &types, package)?;
+        let scope = Scope {
+            schemas: &schemas,
+            types: &types,
+            package,
+        };
+        let body = render_file(&msgs, &scope)?;
         let stem = if opts.file_per_package {
             let filename = buffa_codegen::package_to_filename(key);
             filename
@@ -393,13 +536,12 @@ fn render_package_node(
     }
 }
 
-fn render_file(msgs: &[&MessageValidators], schemas: &cel::SchemaIndex) -> Result<TokenStream> {
+fn render_file(msgs: &[&MessageValidators], scope: &Scope<'_>) -> Result<TokenStream> {
     let impls: Vec<TokenStream> = msgs
         .iter()
-        .map(|m| render_message(m, schemas))
+        .map(|m| render_message(m, scope))
         .collect::<Result<_>>()?;
     Ok(quote! {
-        use super::*;
         #( #impls )*
     })
 }
@@ -426,38 +568,10 @@ pub(crate) fn gen_allows() -> TokenStream {
     }
 }
 
-fn render_message(msg: &MessageValidators, schemas: &cel::SchemaIndex) -> Result<TokenStream> {
+fn render_message(msg: &MessageValidators, scope: &Scope<'_>) -> Result<TokenStream> {
     use std::collections::HashSet;
-    // Use only the message name relative to the package — the generated file
-    // is included inside the package module, so `use super::*;` brings the
-    // type into scope and just the local name is sufficient.
-    //
-    // For `proto_name = "test.v1.ScalarsMessage"` with `package = "test.v1"`,
-    // the local suffix is `ScalarsMessage`. For nested messages like
-    // `"test.v1.Outer.Inner"` the local suffix is `Outer.Inner`; buffa
-    // renders parent segments in snake_case, giving `outer::Inner` — see
-    // the PascalCase → snake_case transform below.
-    let local_name = strip_package_prefix(&msg.proto_name, &msg.package);
-    // For nested messages `Outer.Inner.Leaf`, buffa emits
-    // `outer::inner::Leaf` — parent PascalCase segments lowered to snake_case.
-    let segs: Vec<&str> = local_name.split('.').collect();
-    let rust_segs: Vec<String> = segs
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let is_last = i + 1 == segs.len();
-            let starts_upper = s.chars().next().is_some_and(char::is_uppercase);
-            if !is_last && starts_upper {
-                snake_from_pascal(s)
-            } else {
-                (*s).to_string()
-            }
-        })
-        .collect();
-    let rust_path_str = rust_segs.join("::");
-    let rust_path = syn::parse_str::<syn::Type>(&rust_path_str)?;
-    let view_path =
-        syn::parse_str::<syn::Type>(&format!("__buffa::view::{rust_path_str}View<'_>"))?;
+    let rust_path = scope.message_type(&msg.proto_name, Shape::Owned)?;
+    let view_path = scope.message_type(&msg.proto_name, Shape::View)?;
 
     // Fields listed in a `(buf.validate.message).oneof` get implicit
     // IGNORE_IF_ZERO_VALUE semantics: their rule checks only fire when the
@@ -471,7 +585,7 @@ fn render_message(msg: &MessageValidators, schemas: &cel::SchemaIndex) -> Result
         msg.field_rules
             .iter()
             .map(|f| {
-                let inner = field::emit(f, schemas, shape)?;
+                let inner = field::emit(f, scope, shape)?;
                 if !inner.is_empty()
                     && implicit_ignore.contains(f.field_name.as_str())
                     && !matches!(f.ignore, crate::scan::Ignore::Always)
@@ -503,28 +617,28 @@ fn render_message(msg: &MessageValidators, schemas: &cel::SchemaIndex) -> Result
     let oneof_blocks: Vec<TokenStream> = msg
         .oneof_rules
         .iter()
-        .map(oneof::emit)
+        .map(|v| oneof::emit(v, msg, scope))
         .collect::<Result<_>>()?;
     let view_oneof_blocks: Vec<TokenStream> = msg
         .oneof_rules
         .iter()
-        .map(oneof::emit_view)
+        .map(|v| oneof::emit_view(v, msg, scope))
         .collect::<Result<_>>()?;
 
     // `(buf.validate.message).oneof` — fields where at most one may be set.
     let owned_message_oneof_blocks: Vec<TokenStream> = msg
         .message_oneofs
         .iter()
-        .map(|spec| emit_message_oneof(msg, spec, Shape::Owned))
-        .collect();
+        .map(|spec| emit_message_oneof(msg, spec, scope, Shape::Owned))
+        .collect::<Result<_>>()?;
     let view_message_oneof_blocks: Vec<TokenStream> = msg
         .message_oneofs
         .iter()
-        .map(|spec| emit_message_oneof(msg, spec, Shape::View))
-        .collect();
+        .map(|spec| emit_message_oneof(msg, spec, scope, Shape::View))
+        .collect::<Result<_>>()?;
 
-    let (cel_statics, owned_cel_calls) = cel::emit_message_level(msg, schemas, Shape::Owned);
-    let (_, view_cel_calls) = cel::emit_message_level(msg, schemas, Shape::View);
+    let (cel_statics, owned_cel_calls) = cel::emit_message_level(msg, scope, Shape::Owned)?;
+    let (_, view_cel_calls) = cel::emit_message_level(msg, scope, Shape::View)?;
     let owned_map_bindings = canonical_map_bindings(msg, Shape::Owned);
     let view_map_bindings = canonical_map_bindings(msg, Shape::View);
 
@@ -556,7 +670,7 @@ fn render_message(msg: &MessageValidators, schemas: &cel::SchemaIndex) -> Result
         .into_iter()
         .map(|s| quote! { #allows #s })
         .collect();
-    let render_impl = |rust_path: &syn::Type,
+    let render_impl = |rust_path: &TokenStream,
                        map_bindings: &[TokenStream],
                        field_blocks: &[TokenStream],
                        oneof_blocks: &[TokenStream],
@@ -632,9 +746,11 @@ fn render_message(msg: &MessageValidators, schemas: &cel::SchemaIndex) -> Result
 fn emit_message_oneof(
     msg: &crate::scan::MessageValidators,
     spec: &crate::scan::MessageOneofSpec,
+    scope: &Scope<'_>,
     shape: Shape,
-) -> TokenStream {
+) -> Result<TokenStream> {
     use crate::scan::FieldKind;
+    let oneof_root = scope.types.package_root(&msg.proto_name, scope.package)?;
     let checks: Vec<TokenStream> = spec
         .fields
         .iter()
@@ -649,17 +765,13 @@ fn emit_message_oneof(
                     .iter()
                     .find(|oneof| &oneof.name == oneof_name)?;
                 let accessor = field_ident(&oneof.rust_name);
-                let module = oneof::module_path(&oneof.parent_msg_name);
+                let module = oneof_module(&oneof_root, &msg.package, &msg.proto_name, shape);
                 let enumeration = field_ident(&oneof::to_pascal_case(oneof_name));
                 let variant = field_ident(&oneof::to_pascal_case(&fv.field_name));
-                let oneof_root = match shape {
-                    Shape::Owned => quote! { __buffa::oneof },
-                    Shape::View => quote! { __buffa::view::oneof },
-                };
                 quote! {
                     matches!(
                         &self.#accessor,
-                        Some(#oneof_root::#module::#enumeration::#variant(_))
+                        Some(#module::#enumeration::#variant(_))
                     )
                 }
             } else {
@@ -690,7 +802,7 @@ fn emit_message_oneof(
         })
         .collect();
     let required = spec.required;
-    quote! {
+    Ok(quote! {
         {
             let mut __count: usize = 0;
             #( #checks )*
@@ -712,37 +824,5 @@ fn emit_message_oneof(
                 });
             }
         }
-    }
-}
-
-fn snake_from_pascal(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = String::with_capacity(s.len() + 2);
-    for (i, &c) in chars.iter().enumerate() {
-        if c.is_uppercase() && i > 0 {
-            let prev = chars[i - 1];
-            let next_is_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
-            if prev.is_lowercase() || (prev.is_uppercase() && next_is_lower) {
-                out.push('_');
-            }
-        }
-        out.push(c.to_ascii_lowercase());
-    }
-    out
-}
-
-/// Strip the package prefix from a fully-qualified proto name.
-///
-/// `"test.v1.ScalarsMessage"` with package `"test.v1"` → `"ScalarsMessage"`.
-/// `"example.v1.Outer.Inner"` with package `"example.v1"` → `"Outer.Inner"`.
-/// If `package` is empty or the name does not start with `<package>.`, return
-/// the original name unchanged.
-fn strip_package_prefix<'a>(proto_name: &'a str, package: &str) -> &'a str {
-    if package.is_empty() {
-        return proto_name;
-    }
-    let prefix = format!("{package}.");
-    proto_name
-        .strip_prefix(prefix.as_str())
-        .unwrap_or(proto_name)
+    })
 }

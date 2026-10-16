@@ -215,6 +215,9 @@ pub enum SchemaFieldKind {
     /// A real oneof alternative has presence even when its value is default.
     Oneof {
         accessor: String,
+        /// Path to the package module declaring the message; empty when it
+        /// is the module the validator is emitted in.
+        root: String,
         /// Package-relative name of the message declaring the oneof.
         parent_msg_name: String,
         enumeration: String,
@@ -4285,21 +4288,22 @@ fn has_message_field(
     let tokens = match &entry.kind {
         SchemaFieldKind::Oneof {
             accessor,
+            root,
             parent_msg_name,
             enumeration,
             variant,
             view,
         } => {
             let accessor = crate::emit::field_ident(accessor);
-            let module = super::oneof::module_path(parent_msg_name);
+            let shape = if *view {
+                crate::emit::Shape::View
+            } else {
+                crate::emit::Shape::Owned
+            };
+            let module = crate::emit::oneof_module(root, "", parent_msg_name, shape);
             let enumeration = crate::emit::field_ident(enumeration);
             let variant = crate::emit::field_ident(variant);
-            let root = if *view {
-                quote! { __buffa::view::oneof }
-            } else {
-                quote! { __buffa::oneof }
-            };
-            quote! { matches!(&#operand.#accessor, Some(#root::#module::#enumeration::#variant(_))) }
+            quote! { matches!(&#operand.#accessor, Some(#module::#enumeration::#variant(_))) }
         }
         SchemaFieldKind::Scalar => match &entry.ty {
             CelType::Int => {
@@ -4370,6 +4374,7 @@ mod tests {
                     ty: CelType::Dyn,
                     kind: SchemaFieldKind::Oneof {
                         accessor: "origin".to_owned(),
+                        root: String::new(),
                         parent_msg_name: "Batch.Source".to_owned(),
                         enumeration: "Origin".to_owned(),
                         variant: "Produced".to_owned(),

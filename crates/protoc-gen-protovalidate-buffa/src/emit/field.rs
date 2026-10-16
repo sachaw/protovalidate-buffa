@@ -28,7 +28,7 @@ use crate::scan::{
 )]
 pub(crate) fn emit(
     field: &FieldValidator,
-    schemas: &crate::emit::cel::SchemaIndex,
+    scope: &crate::emit::Scope<'_>,
     shape: crate::emit::Shape,
 ) -> Result<TokenStream> {
     if matches!(field.ignore, Ignore::Always) {
@@ -195,6 +195,7 @@ pub(crate) fn emit(
                     field.field_number,
                     e,
                     full_name,
+                    scope,
                 )?);
             }
         }
@@ -202,7 +203,7 @@ pub(crate) fn emit(
             // EXPLICIT-presence scalar: buffa generates `Option<T>`.
             // Emit all rules inside a guard that binds `v` without moving out
             // of `self`. Copy types bind by value; String/Bytes bind as slices.
-            let inner_blocks = emit_optional_inner(&accessor, name_lit, inner, field)?;
+            let inner_blocks = emit_optional_inner(&accessor, name_lit, inner, field, scope)?;
             if !inner_blocks.is_empty() {
                 match inner.as_ref() {
                     FieldKind::String => blocks.push(quote! {
@@ -232,15 +233,16 @@ pub(crate) fn emit(
                     kind_to_field_type(inner),
                     r,
                     inner,
-                    schemas,
+                    scope,
+                    shape,
                 )?);
             } else if let FieldKind::Message { full_name } = inner.as_ref() {
                 // Repeated message with no repeated-level rules — still recurse.
-                if !full_name.starts_with("google.protobuf.") {
+                if let Some(validate) = scope.nested_validate(full_name, shape, &quote! { elem })? {
                     let fnum = field.field_number;
                     blocks.push(quote! {
                         for (idx, elem) in self.#accessor.iter().enumerate() {
-                            if let Err(sub) = elem.validate() {
+                            if let Err(sub) = #validate {
                                 violations.extend(sub.violations.into_iter().map(|mut v| {
                                     v.field.elements.insert(0, ::protovalidate_buffa::FieldPathElement {
                                         field_number: Some(#fnum),
@@ -268,12 +270,15 @@ pub(crate) fn emit(
                     m,
                     key,
                     value,
-                    schemas,
+                    scope,
+                    shape,
                 )?);
             } else if let FieldKind::Message { full_name } = value.as_ref() {
                 // Map<K, Message> with no map-level rules — still recurse
                 // into message values so nested validators fire.
-                if !full_name.starts_with("google.protobuf.") {
+                if let Some(validate) =
+                    scope.nested_validate(full_name, shape, &quote! { value })?
+                {
                     let fnum = field.field_number;
                     let nl = name_lit;
                     let key_ty_ident = format_ident!("{}", kind_to_field_type(key));
@@ -283,7 +288,7 @@ pub(crate) fn emit(
                     {
                         blocks.push(quote! {
                             for (key, value) in (#map).iter() {
-                                if let Err(sub) = value.validate() {
+                                if let Err(sub) = #validate {
                                     violations.extend(sub.violations.into_iter().map(|mut v| {
                                         v.field.elements.insert(0, ::protovalidate_buffa::FieldPathElement {
                                             field_number: Some(#fnum),
@@ -314,7 +319,10 @@ pub(crate) fn emit(
             // Generating `self.grading_started.as_option()` for a oneof field would
             // not compile. Fields in oneofs are only recursed via oneof.rs (which
             // emits a match arm over the oneof enum).
-            if !full_name.starts_with("google.protobuf.") && field.oneof_name.is_none() {
+            if field.oneof_name.is_none()
+                && let Some(validate) =
+                    scope.nested_validate(full_name, shape, &quote! { inner })?
+            {
                 let fnum = field.field_number;
                 let ty_ident = if field.is_group {
                     format_ident!("Group")
@@ -323,7 +331,7 @@ pub(crate) fn emit(
                 };
                 blocks.push(quote! {
                     if let Some(inner) = self.#accessor.as_option() {
-                        if let Err(sub) = inner.validate() {
+                        if let Err(sub) = #validate {
                             violations.extend(sub.violations.into_iter().map(|mut v| {
                                 v.field.elements.insert(0, ::protovalidate_buffa::FieldPathElement {
                                     field_number: Some(#fnum),
@@ -579,6 +587,7 @@ fn emit_optional_inner(
     name_lit: &str,
     inner: &FieldKind,
     field: &FieldValidator,
+    scope: &crate::emit::Scope<'_>,
 ) -> Result<Vec<TokenStream>> {
     // For numeric kinds, emit metadata-bearing checks inline so the
     // conformance diff includes field_number + field_type.
@@ -963,7 +972,7 @@ fn emit_optional_inner(
         }
         FieldKind::Enum { full_name } => {
             if let Some(e) = &field.standard.enum_rules {
-                let checks = emit_enum_checks_on(&v, name_lit, field.field_number, e, full_name)?;
+                let checks = emit_enum_checks_on(&v, name_lit, field.field_number, e, full_name, scope)?;
                 if !checks.is_empty() {
                     out.push(quote! {
                         // Closed enums use the trait method; open enums have
@@ -1012,9 +1021,10 @@ pub(crate) fn emit_enum_checks_on(
     field_number: i32,
     e: &EnumStandard,
     full_name: &str,
+    scope: &crate::emit::Scope<'_>,
 ) -> Result<Vec<TokenStream>> {
     let value = quote! { #val };
-    emit_enum_value(&value, name_lit, field_number, e, full_name)
+    emit_enum_value(&value, name_lit, field_number, e, full_name, scope)
 }
 
 // Variants of numeric/float emitters that take an explicit `value_ident`
@@ -3459,9 +3469,10 @@ fn emit_enum(
     field_number: i32,
     e: &EnumStandard,
     full_name: &str,
+    scope: &crate::emit::Scope<'_>,
 ) -> Result<Vec<TokenStream>> {
     let value = quote! { self.#accessor };
-    emit_enum_value(&value, name_lit, field_number, e, full_name)
+    emit_enum_value(&value, name_lit, field_number, e, full_name, scope)
 }
 
 fn emit_enum_value(
@@ -3470,11 +3481,13 @@ fn emit_enum_value(
     field_number: i32,
     e: &EnumStandard,
     full_name: &str,
+    scope: &crate::emit::Scope<'_>,
 ) -> Result<Vec<TokenStream>> {
     emit_enum_checks(
         value,
         e,
         full_name,
+        scope,
         &field_path_scalar(name_lit, field_number, "Enum"),
         |inner, inner_num, ty| rule_path_scalar("enum", 16, inner, inner_num, ty),
     )
@@ -3486,6 +3499,7 @@ pub(super) fn emit_enum_checks(
     value: &TokenStream,
     e: &EnumStandard,
     full_name: &str,
+    scope: &crate::emit::Scope<'_>,
     field_path: &TokenStream,
     rule_path: impl Fn(&str, i32, &str) -> TokenStream,
 ) -> Result<Vec<TokenStream>> {
@@ -3514,7 +3528,7 @@ pub(super) fn emit_enum_checks(
     }
 
     if e.defined_only == Some(true) {
-        let enum_type = resolve_local_type(full_name)?;
+        let enum_type = scope.enum_type(full_name)?;
         let field = field_path;
         let rule = rule_path("defined_only", 2, "Bool");
         out.push(quote! {
@@ -3579,105 +3593,6 @@ pub(super) fn emit_enum_checks(
     }
 
     Ok(out)
-}
-
-/// Resolve a proto fully-qualified name to a local Rust type path.
-///
-/// E.g. `"example.v1.Foo"` → `syn::Path` for `ClothingType` (the last
-/// segment). The generated file is included inside the correct module so the
-/// local name resolves via the `use super::*;` at the top of the file.
-///
-/// Nested types (e.g. `"example.v1.Outer.InnerEnum"`) resolve through
-/// [`resolve_type_from_package`], which lowers parent PascalCase segments
-/// into the snake_case module names buffa emits (`outer::InnerEnum`).
-fn resolve_local_type(full_name: &str) -> Result<syn::Path> {
-    resolve_type_from_package(full_name, "")
-}
-
-/// Resolve a proto fully-qualified type name into the Rust path that's valid
-/// from within `cur_package`'s module. Buffa places each proto package at
-/// `crate::<pkg_segments_separated_by_::>`, with nested message/enum parents
-/// lowered into snake_case modules. `cur_package` is the current proto
-/// package (e.g. `buf.validate.conformance.cases`). If the target type lives
-/// in a descendant or sibling package, the returned path walks through the
-/// appropriate module segments.
-fn resolve_type_from_package(full_name: &str, cur_package: &str) -> Result<syn::Path> {
-    let stripped = full_name.strip_prefix('.').unwrap_or(full_name);
-    let segments: Vec<&str> = stripped.split('.').collect();
-    if segments.is_empty() {
-        anyhow::bail!("empty type name: {full_name:?}");
-    }
-
-    // Split into (package_segments, type_segments). Walk from the end; every
-    // trailing PascalCase segment is a type; the rest is the package.
-    let split = segments
-        .iter()
-        .rposition(|s| !s.chars().next().is_some_and(char::is_uppercase))
-        .map_or(0, |i| i + 1);
-    let pkg_segments: &[&str] = &segments[..split];
-    let type_segments: &[&str] = &segments[split..];
-    if type_segments.is_empty() {
-        anyhow::bail!("no type segment in: {full_name:?}");
-    }
-
-    // Determine the relative package path from cur_package to target package.
-    let cur: Vec<&str> = if cur_package.is_empty() {
-        Vec::new()
-    } else {
-        cur_package.split('.').collect()
-    };
-    let common = cur
-        .iter()
-        .zip(pkg_segments.iter())
-        .take_while(|(a, b)| a == b)
-        .count();
-    // Buffa's module structure: each package segment is its own `pub mod`.
-    // If target is a descendant of current, we walk down. If a sibling /
-    // ancestor, we'd need to walk up — but from inside a package module
-    // the parent modules are accessible (the package module is inside `buf::...`),
-    // however `use super::*;` brings only the immediate parent's items into
-    // scope. A safer approach: always reference via absolute `crate::...`.
-    // But our emitted code uses `use super::*;` and we don't know what path
-    // `crate` points to from the consumer's perspective. As a workaround,
-    // prefer descending references via package module names when the target
-    // is deeper, and otherwise emit a relative path that goes up through
-    // `super::`.
-    let mut path = String::new();
-    let descend = &pkg_segments[common..];
-    let ascend_count = cur.len() - common;
-    for _ in 0..ascend_count {
-        path.push_str("super::");
-    }
-    for seg in descend {
-        path.push_str(seg);
-        path.push_str("::");
-    }
-    let last_idx = type_segments.len() - 1;
-    for (i, s) in type_segments.iter().enumerate() {
-        if i == last_idx {
-            path.push_str(s);
-        } else {
-            path.push_str(&to_snake_case(s));
-            path.push_str("::");
-        }
-    }
-    syn::parse_str::<syn::Path>(&path).map_err(Into::into)
-}
-
-fn to_snake_case(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = String::with_capacity(s.len() + 2);
-    for (i, &c) in chars.iter().enumerate() {
-        if c.is_uppercase() && i > 0 {
-            let prev = chars[i - 1];
-            let next_is_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
-            if prev.is_lowercase() || (prev.is_uppercase() && next_is_lower) {
-                out.push('_');
-            }
-        }
-        out.push(c.to_ascii_lowercase());
-    }
-    out
 }
 
 /// Build an Ident that's safe to use as a Rust identifier. If the input

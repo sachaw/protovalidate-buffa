@@ -137,8 +137,15 @@ fn main() {
     };
     let validators =
         protoc_gen_protovalidate_buffa::scan::gather(&request).expect("protovalidate scan failed");
-    let emitted = protoc_gen_protovalidate_buffa::emit::render(&validators)
-        .expect("protovalidate emit failed");
+    // The merged include below mounts buffa's tree at `crate::generated`.
+    let emitted = protoc_gen_protovalidate_buffa::emit::render_request(
+        &request,
+        &protoc_gen_protovalidate_buffa::emit::Options {
+            proto_module: "crate::generated".to_string(),
+            ..Default::default()
+        },
+    )
+    .expect("protovalidate emit failed");
 
     // Write each emitted file under a `pv_` prefix so it doesn't collide with
     // buffa-build's output. Emitted filename is `<stem_with_dots>.rs` —
@@ -222,15 +229,13 @@ fn write_field_name_fixtures(
             parameter: Some(format!("idiomatic_field_names={idiomatic}")),
             ..Default::default()
         };
-        let scanned = protoc_gen_protovalidate_buffa::scan::gather(&request)
-            .expect("scan field-name fixtures");
         let options = protoc_gen_protovalidate_buffa::emit::Options {
             proto_module: format!("crate::{mode}::proto"),
             ..Default::default()
         };
         let validators = directory.join("validators");
         std::fs::create_dir_all(&validators).expect("create naming validators directory");
-        for file in protoc_gen_protovalidate_buffa::emit::render_with_options(&scanned, &options)
+        for file in protoc_gen_protovalidate_buffa::emit::render_request(&request, &options)
             .expect("render field-name validators")
         {
             std::fs::write(
@@ -278,8 +283,6 @@ fn write_module_tree_fixtures(
         proto_file: fds.file.clone(),
         ..Default::default()
     };
-    let validators = protoc_gen_protovalidate_buffa::scan::gather(&request)
-        .expect("module-tree validator scan failed");
     for (directory, options) in [
         (
             "default",
@@ -303,9 +306,8 @@ fn write_module_tree_fixtures(
     ] {
         let destination = fixture_dir.join(directory);
         std::fs::create_dir_all(&destination).expect("create module-tree fixture directory");
-        let files =
-            protoc_gen_protovalidate_buffa::emit::render_with_options(&validators, &options)
-                .expect("module-tree validator generation failed");
+        let files = protoc_gen_protovalidate_buffa::emit::render_request(&request, &options)
+            .expect("module-tree validator generation failed");
         for file in files {
             std::fs::write(
                 destination.join(file.name.expect("generated file name")),

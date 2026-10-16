@@ -7,7 +7,7 @@ use buffa_codegen::{
     CodeGenConfig,
     generated::{compiler::CodeGeneratorRequest, descriptor::FileDescriptorSet},
 };
-use protoc_gen_protovalidate_buffa::{emit, scan};
+use protoc_gen_protovalidate_buffa::emit;
 
 fn main() -> anyhow::Result<()> {
     let out = PathBuf::from(env::var("OUT_DIR")?);
@@ -65,7 +65,7 @@ fn main() -> anyhow::Result<()> {
         ),
     ] {
         request.file_to_generate = sources.iter().map(|s| (*s).to_string()).collect();
-        for file in emit::render_with_options(&scan::gather(&request)?, &options)? {
+        for file in emit::render_request(&request, &options)? {
             fs::write(
                 out.join(file.name.as_deref().expect("generated filename")),
                 file.content.as_deref().expect("generated content"),

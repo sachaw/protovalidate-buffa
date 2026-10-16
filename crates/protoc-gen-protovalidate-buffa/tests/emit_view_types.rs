@@ -19,9 +19,14 @@ fn nested_message_emits_owned_and_view_validators() {
         .into_iter()
         .filter_map(|file| file.content)
         .collect::<String>();
+    // prettyplease wraps long impl headers; compare whitespace-normalized.
+    let source = source.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    assert!(source.contains("Validate for outer::Nested"));
-    assert!(source.contains("Validate for __buffa::view::outer::NestedView<'_>"));
+    assert!(source.contains("Validate for crate::proto::test::v1::outer::Nested"));
+    assert!(
+        source
+            .contains("Validate for crate::proto::test::v1::__buffa::view::outer::NestedView<'_>")
+    );
     assert_eq!(source.matches("let mut violations").count(), 2);
     assert!(!source.contains("to_owned_message"));
 }

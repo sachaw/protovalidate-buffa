@@ -22,6 +22,7 @@ fn emit_map_kv_checks(
     key_kind_variant: &str,
     value_kind_variant: &str,
     for_key: bool,
+    scope: &crate::emit::Scope<'_>,
 ) -> Result<Vec<TokenStream>> {
     let mut out: Vec<TokenStream> = Vec::new();
     let key_ty = format_ident!("{}", key_kind_variant);
@@ -267,6 +268,7 @@ fn emit_map_kv_checks(
                     &quote! { #elem_ident },
                     rules,
                     full_name,
+                    scope,
                     &field_path,
                     |name, number, ty| rule_path_5("enum", 16, name, number, ty),
                 )?);
@@ -389,6 +391,7 @@ fn emit_repeated_items_checks(
     name_lit: &str,
     field_number: i32,
     element_type_variant: &str,
+    scope: &crate::emit::Scope<'_>,
 ) -> Result<Vec<TokenStream>> {
     let mut out: Vec<TokenStream> = Vec::new();
     let ety = format_ident!("{}", element_type_variant);
@@ -761,6 +764,7 @@ fn emit_repeated_items_checks(
                     &quote! { #elem_ident },
                     e,
                     full_name,
+                    scope,
                     &fp_idx,
                     |name, number, ty| rule_path_4("enum", 16, name, number, ty),
                 )?);
@@ -1151,15 +1155,21 @@ fn map_rule_path_ty(inner: &str, inner_num: i32, ty: &str) -> TokenStream {
 /// Panics if `min_items` or `max_items` cannot be converted to `usize`. In
 /// practice proto length bounds are small non-negative integers, so this
 /// invariant always holds.
-pub fn emit_repeated(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the field's identity, its rules, and the scope and shape the nested-message call resolves against are all independent inputs"
+)]
+pub(crate) fn emit_repeated(
     accessor: &syn::Ident,
     name_lit: &str,
     field_number: i32,
     element_type_variant: &str,
     spec: &RepeatedStandard,
     element_kind: &FieldKind,
-    schemas: &crate::emit::cel::SchemaIndex,
+    scope: &crate::emit::Scope<'_>,
+    shape: crate::emit::Shape,
 ) -> Result<TokenStream> {
+    let schemas = scope.schemas;
     let mut out: Vec<TokenStream> = Vec::new();
     let fp = || repeated_field_path(name_lit, field_number, element_type_variant);
 
@@ -1237,6 +1247,7 @@ pub fn emit_repeated(
                 name_lit,
                 field_number,
                 element_type_variant,
+                scope,
             )?;
             if !items_checks.is_empty() {
                 let ignore_empty = matches!(items.ignore, crate::scan::Ignore::IfZeroValue);
@@ -1819,12 +1830,12 @@ pub fn emit_repeated(
     // validate) and any cross-package messages where we can't guarantee an
     // impl Validate exists.
     if let FieldKind::Message { full_name } = element_kind
-        && !full_name.starts_with("google.protobuf.")
+        && let Some(validate) = scope.nested_validate(full_name, shape, &quote! { elem })?
     {
         let fnum = field_number;
         out.push(quote! {
             for (idx, elem) in self.#accessor.iter().enumerate() {
-                if let Err(sub) = elem.validate() {
+                if let Err(sub) = #validate {
                     violations.extend(sub.violations.into_iter().map(|mut v| {
                         v.field.elements.insert(0, ::protovalidate_buffa::FieldPathElement {
                             field_number: Some(#fnum),
@@ -1863,15 +1874,21 @@ pub fn emit_repeated(
 /// Panics if `min_pairs` or `max_pairs` cannot be converted to `usize`. In
 /// practice proto size bounds are small non-negative integers, so this
 /// invariant always holds.
-pub fn emit_map(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the field's identity, its rules, and the scope and shape the nested-message call resolves against are all independent inputs"
+)]
+pub(crate) fn emit_map(
     map: &TokenStream,
     name_lit: &str,
     field_number: i32,
     spec: &MapStandard,
     key_kind: &FieldKind,
     value_kind: &FieldKind,
-    schemas: &crate::emit::cel::SchemaIndex,
+    scope: &crate::emit::Scope<'_>,
+    shape: crate::emit::Shape,
 ) -> Result<TokenStream> {
+    let schemas = scope.schemas;
     let mut out: Vec<TokenStream> = Vec::new();
     let fp = || map_field_path(name_lit, field_number);
 
@@ -1936,6 +1953,7 @@ pub fn emit_map(
             key_ty_variant,
             val_ty_variant,
             true,
+            scope,
         )?;
         if rich.is_empty() {
             emit_scalar_checks(&format_ident!("key"), key_kind, &k.standard, name_lit, true)
@@ -1958,6 +1976,7 @@ pub fn emit_map(
             key_ty_variant,
             val_ty_variant,
             false,
+            scope,
         )?;
         if rich.is_empty() {
             emit_scalar_checks(
@@ -2133,7 +2152,7 @@ pub fn emit_map(
 
     // Recurse into message-typed map values so nested validators fire.
     if let FieldKind::Message { full_name } = value_kind
-        && !full_name.starts_with("google.protobuf.")
+        && let Some(validate) = scope.nested_validate(full_name, shape, &quote! { value })?
     {
         let key_subscript_opt =
             kind_variant_to_subscript(crate::emit::field::kind_to_field_type(key_kind));
@@ -2142,7 +2161,7 @@ pub fn emit_map(
             let vt = format_ident!("{}", crate::emit::field::kind_to_field_type(value_kind));
             out.push(quote! {
                 for (key, value) in (#map).iter() {
-                    if let Err(sub) = value.validate() {
+                    if let Err(sub) = #validate {
                         violations.extend(sub.violations.into_iter().map(|mut v| {
                             v.field.elements.insert(0, ::protovalidate_buffa::FieldPathElement {
                                 field_number: Some(#field_number),

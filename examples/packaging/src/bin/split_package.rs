@@ -23,9 +23,6 @@ mod example {
     }
     pub mod orders {
         pub mod v1 {
-            // Enum validation uses protobuf paths beginning at `example`.
-            use crate::example;
-
             include!(concat!(env!("OUT_DIR"), "/example.orders.v1.rs"));
             include!(concat!(env!("OUT_DIR"), "/example.orders.v1.validate.rs"));
         }

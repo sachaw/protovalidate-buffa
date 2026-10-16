@@ -4,13 +4,10 @@ use anyhow::Result;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
-use crate::scan::{FieldKind, FieldValidator, OneofValidator};
-
-#[derive(Clone, Copy)]
-enum Representation {
-    Owned,
-    View,
-}
+use crate::{
+    emit::{Scope, Shape},
+    scan::{FieldKind, FieldValidator, MessageValidators, OneofValidator},
+};
 
 /// Emit the validation snippet for a single oneof.
 ///
@@ -24,15 +21,28 @@ enum Representation {
 /// Returns an error if a variant's enum-rule type reference cannot be resolved
 /// to a local Rust path. (Field/oneof names are escaped via
 /// [`crate::emit::field_ident`], which is infallible.)
-pub fn emit(v: &OneofValidator) -> Result<TokenStream> {
-    emit_for(v, Representation::Owned)
+pub(crate) fn emit(
+    v: &OneofValidator,
+    msg: &MessageValidators,
+    scope: &Scope<'_>,
+) -> Result<TokenStream> {
+    emit_for(v, msg, scope, Shape::Owned)
 }
 
-pub(crate) fn emit_view(v: &OneofValidator) -> Result<TokenStream> {
-    emit_for(v, Representation::View)
+pub(crate) fn emit_view(
+    v: &OneofValidator,
+    msg: &MessageValidators,
+    scope: &Scope<'_>,
+) -> Result<TokenStream> {
+    emit_for(v, msg, scope, Shape::View)
 }
 
-fn emit_for(v: &OneofValidator, representation: Representation) -> Result<TokenStream> {
+fn emit_for(
+    v: &OneofValidator,
+    msg: &MessageValidators,
+    scope: &Scope<'_>,
+    shape: Shape,
+) -> Result<TokenStream> {
     let has_required = v.required;
     // If nothing to emit at all, skip.
     let has_variant_rules = v.fields.iter().any(has_field_rules);
@@ -46,12 +56,8 @@ fn emit_for(v: &OneofValidator, representation: Representation) -> Result<TokenS
 
     // These are constant across all variants, so derive them once and pass them
     // down to the per-variant emitters.
-    let module = module_path(&v.parent_msg_name);
+    let module = scope.oneof_module(&msg.proto_name, &msg.package, shape)?;
     let oneof_enum_ident = crate::emit::field_ident(&to_pascal_case(&v.name));
-    let oneof_root = match representation {
-        Representation::Owned => quote! { __buffa::oneof },
-        Representation::View => quote! { __buffa::view::oneof },
-    };
 
     let none_arm = if has_required {
         quote! {
@@ -87,7 +93,7 @@ fn emit_for(v: &OneofValidator, representation: Representation) -> Result<TokenS
         .fields
         .iter()
         .filter(|f| has_field_rules(f))
-        .map(|f| emit_variant_arm(f, &oneof_root, &module, &oneof_enum_ident))
+        .map(|f| emit_variant_arm(f, &module, &oneof_enum_ident, scope, shape))
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .filter(|ts| !ts.is_empty())
@@ -95,7 +101,7 @@ fn emit_for(v: &OneofValidator, representation: Representation) -> Result<TokenS
 
     // Compute required_variant_blocks early so they survive all early-return paths.
     let required_variant_blocks =
-        emit_required_variant_blocks(v, &accessor, &oneof_root, &module, &oneof_enum_ident);
+        emit_required_variant_blocks(v, &accessor, &module, &oneof_enum_ident);
 
     // If no variant has rules, we only need the None check (already handled above).
     if some_arms.is_empty() && !has_required && !has_required_variants {
@@ -158,7 +164,6 @@ fn emit_for(v: &OneofValidator, representation: Representation) -> Result<TokenS
 fn emit_required_variant_blocks(
     v: &OneofValidator,
     accessor: &syn::Ident,
-    oneof_root: &TokenStream,
     module: &TokenStream,
     oneof_enum_ident: &syn::Ident,
 ) -> Vec<TokenStream> {
@@ -195,7 +200,7 @@ fn emit_required_variant_blocks(
             _ => quote!(Message),
         };
         out.push(quote! {
-            if !matches!(&self.#accessor, Some(#oneof_root::#module::#oneof_enum_ident::#variant_ident(_))) {
+            if !matches!(&self.#accessor, Some(#module::#oneof_enum_ident::#variant_ident(_))) {
                 violations.push(::protovalidate_buffa::Violation {
                     field: ::protovalidate_buffa::FieldPath {
                         elements: ::std::vec![
@@ -256,9 +261,10 @@ fn has_field_rules(f: &FieldValidator) -> bool {
 /// Emit a `Some(Variant(v)) => { ... }` match arm for a single oneof field.
 fn emit_variant_arm(
     f: &FieldValidator,
-    oneof_root: &TokenStream,
     module: &TokenStream,
     oneof_enum_ident: &syn::Ident,
+    scope: &Scope<'_>,
+    shape: Shape,
 ) -> Result<TokenStream> {
     if matches!(f.ignore, crate::scan::Ignore::Always) {
         return Ok(quote! {});
@@ -332,14 +338,18 @@ fn emit_variant_arm(
                     f.field_number,
                     e,
                     full_name,
+                    scope,
                 )?);
             }
         }
         FieldKind::Message { full_name } if !full_name.starts_with("google.protobuf.") => {
-            let fnum = f.field_number;
-            let nlit = name_lit.clone();
-            checks.push(quote! {
-                if let Err(sub) = #val_ident.validate() {
+            if let Some(validate) =
+                scope.nested_validate(full_name, shape, &quote! { #val_ident })?
+            {
+                let fnum = f.field_number;
+                let nlit = name_lit.clone();
+                checks.push(quote! {
+                if let Err(sub) = #validate {
                     violations.extend(sub.violations.into_iter().map(|mut v| {
                         v.field.elements.insert(0, ::protovalidate_buffa::FieldPathElement {
                             field_number: Some(#fnum),
@@ -352,7 +362,8 @@ fn emit_variant_arm(
                         v
                     }));
                 }
-            });
+                });
+            }
         }
         FieldKind::Message { full_name } => {
             checks.extend(emit_oneof_wkt_checks(f, full_name, &val_ident));
@@ -410,14 +421,14 @@ fn emit_variant_arm(
     );
     if needs_copy_deref {
         Ok(quote! {
-            Some(#oneof_root::#module::#oneof_enum_ident::#variant_ident(__oneof_val)) => {
+            Some(#module::#oneof_enum_ident::#variant_ident(__oneof_val)) => {
                 let #val_ident = *__oneof_val;
                 #( #checks )*
             }
         })
     } else {
         Ok(quote! {
-            Some(#oneof_root::#module::#oneof_enum_ident::#variant_ident(#val_ident)) => {
+            Some(#module::#oneof_enum_ident::#variant_ident(#val_ident)) => {
                 #( #checks )*
             }
         })

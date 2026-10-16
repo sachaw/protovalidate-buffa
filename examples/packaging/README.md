@@ -43,8 +43,7 @@ validators. Adding another message file to that package needs no new include.
 
 `LineItem` references [`Currency`](proto/shared/currency.proto) from
 `example.money.v1`. The handwritten modules preserve the package hierarchy so
-Buffa's relative paths resolve. It also imports `crate::example` in the orders
-module so validators can resolve the enum's `example::money::v1::Currency` path.
+the relative paths Buffa and the validators share resolve.
 The currency
 package has no messages and needs no validator file. Source directories do
 not mirror package names in these schemas.
