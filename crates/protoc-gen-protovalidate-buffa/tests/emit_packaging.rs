@@ -79,7 +79,7 @@ fn flat_output_merges_declared_packages_and_includes_owned_and_view_impls() {
         // Beside Buffa's types, validators name them relative to the package.
         assert!(!content.contains("use super::*;"));
         for name in types {
-            assert!(content.contains(&format!("Validate for {name}")));
+            assert!(content.contains(&format!("Validate<__Validators> for {name}")));
             assert!(content.contains(&format!("__buffa::view::{name}View<'_>")));
         }
     }
@@ -195,8 +195,8 @@ fn unnamed_package_and_rs_suffix_follow_buffa_filenames() {
         .collect();
     assert_eq!(names, ["__buffa.validate.rs", "other.rs.validate.rs"]);
     let unnamed = response.file[0].content.as_deref().unwrap();
-    assert!(unnamed.contains("Validate for First"));
-    assert!(unnamed.contains("Validate for Second"));
+    assert!(unnamed.contains("Validate<__Validators> for First"));
+    assert!(unnamed.contains("Validate<__Validators> for Second"));
 }
 
 #[test]
@@ -218,9 +218,9 @@ fn imported_messages_are_not_emitted() {
     let file = &response.file[0];
     assert_eq!(file.name.as_deref(), Some("example.v1.validate.rs"));
     let content = file.content.as_deref().unwrap();
-    assert!(content.contains("Validate for Second"));
-    assert!(!content.contains("Validate for First"));
-    assert!(!content.contains("Validate for Third"));
+    assert!(content.contains("Validate<__Validators> for Second"));
+    assert!(!content.contains("Validate<__Validators> for First"));
+    assert!(!content.contains("Validate<__Validators> for Third"));
 }
 
 #[test]
@@ -263,9 +263,20 @@ fn packaging_and_file_per_package_are_independent() {
             syn::parse_file(file.content.as_deref().unwrap()).expect("valid Rust syntax");
         }
         if parameter == "packaging=true,file_per_package=true" {
-            let package = response.file[0].content.as_deref().unwrap();
-            assert!(package.contains("Validate for crate::proto::example::v1::First"));
-            assert!(package.contains("Validate for crate::proto::example::v1::Second"));
+            // prettyplease wraps long impl headers; compare whitespace-normalized.
+            let package = response.file[0]
+                .content
+                .as_deref()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                package.contains("Validate<__Validators> for crate::proto::example::v1::First")
+            );
+            assert!(
+                package.contains("Validate<__Validators> for crate::proto::example::v1::Second")
+            );
             assert!(
                 response.file[2]
                     .content
@@ -273,13 +284,15 @@ fn packaging_and_file_per_package_are_independent() {
                     .unwrap()
                     .contains("include!(\"example.v1.rs\");")
             );
+            // Validators name types absolutely, so the tree imports nothing.
             assert!(
-                response.file[4]
+                !response.file[4]
                     .content
                     .as_deref()
                     .unwrap()
-                    .contains("crate::proto::example::v1::*")
+                    .contains("use crate::proto")
             );
+            assert!(package.contains("pub enum __Validators {}"));
         }
     }
 }
@@ -328,7 +341,7 @@ fn invalid_file_per_package_returns_error_without_files() {
 }
 
 #[test]
-fn packaged_unnamed_package_uses_buffa_stem_and_root_import() {
+fn packaged_unnamed_package_uses_buffa_stem_at_the_root() {
     let mut request = request();
     request.file_to_generate = vec!["second.proto".into()];
     request.proto_file[1].package = None;
@@ -342,6 +355,6 @@ fn packaged_unnamed_package_uses_buffa_stem_and_root_import() {
         .collect();
     assert_eq!(names, ["__buffa.rs", "__buffa.mod.rs", "mod.rs"]);
     let root = response.file[2].content.as_deref().unwrap();
-    assert!(root.contains("use crate::proto::*;"));
+    assert!(!root.contains("use crate::proto"));
     assert!(root.contains("include!(\"__buffa.mod.rs\");"));
 }

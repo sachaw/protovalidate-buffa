@@ -25,15 +25,15 @@ mod generated {
 /// Decode the same wire value into both representations, distinguishing explicit
 /// zero from absence. Unknown numbers are retained by open enums and treated as
 /// absent by closed enums. `None` supplies an absent field.
-fn assert_enum<M>(
+fn assert_enum<M, S>(
     number: u8,
     name: &str,
     value: Option<i32>,
     expected: &[&str],
 ) -> Result<(), buffa::DecodeError>
 where
-    M: HasMessageView + Validate,
-    for<'a> M::View<'a>: Validate,
+    M: HasMessageView + Validate<S>,
+    for<'a> M::View<'a>: Validate<S>,
 {
     let mut bytes = Vec::new();
     if let Some(value) = value {
@@ -117,9 +117,9 @@ macro_rules! presence_tests {
             // https://github.com/mathematic-inc/protovalidate-buffa/discussions/103
             #[test]
             fn absent_and_valid_present_enums_pass() -> Result<(), buffa::DecodeError> {
-                assert_enum::<EnumRules>(1, "defined", None, &[])?;
+                assert_enum::<EnumRules, _>(1, "defined", None, &[])?;
                 for value in [0, 1, -1] {
-                    assert_enum::<EnumRules>(1, "defined", Some(value), &[])?;
+                    assert_enum::<EnumRules, _>(1, "defined", Some(value), &[])?;
                 }
                 for (number, name) in [
                     (2, "constant"),
@@ -127,7 +127,7 @@ macro_rules! presence_tests {
                     (4, "disallowed"),
                     (6, "combined"),
                 ] {
-                    assert_enum::<EnumRules>(number, name, Some(1), &[])?;
+                    assert_enum::<EnumRules, _>(number, name, Some(1), &[])?;
                 }
                 Ok(())
             }
@@ -136,7 +136,7 @@ macro_rules! presence_tests {
             #[test]
             fn undefined_numbers_follow_enum_openness() -> Result<(), buffa::DecodeError> {
                 for value in [7, -7, i32::MIN, i32::MAX] {
-                    assert_enum::<EnumRules>(1, "defined", Some(value), &$unknown)?;
+                    assert_enum::<EnumRules, _>(1, "defined", Some(value), &$unknown)?;
                 }
                 Ok(())
             }
@@ -149,7 +149,7 @@ macro_rules! presence_tests {
                     (3, "allowed", "in"),
                     (4, "disallowed", "not_in"),
                 ] {
-                    assert_enum::<EnumRules>(number, name, Some(0), &[rule])?;
+                    assert_enum::<EnumRules, _>(number, name, Some(0), &[rule])?;
                 }
                 Ok(())
             }
@@ -157,32 +157,32 @@ macro_rules! presence_tests {
             // https://github.com/mathematic-inc/protovalidate-buffa/discussions/103
             #[test]
             fn combined_rules_report_every_violation() -> Result<(), buffa::DecodeError> {
-                assert_enum::<EnumRules>(6, "combined", Some(0), &["const", "in", "not_in"])?;
-                assert_enum::<EnumRules>(6, "combined", Some(7), &$combined_unknown)
+                assert_enum::<EnumRules, _>(6, "combined", Some(0), &["const", "in", "not_in"])?;
+                assert_enum::<EnumRules, _>(6, "combined", Some(7), &$combined_unknown)
             }
 
             // https://github.com/mathematic-inc/protovalidate-buffa/discussions/103
             #[test]
             fn disabled_defined_only_preserves_not_in() -> Result<(), buffa::DecodeError> {
-                assert_enum::<EnumRules>(5, "disabled", Some(7), &[])?;
-                assert_enum::<EnumRules>(5, "disabled", Some(0), &["not_in"])
+                assert_enum::<EnumRules, _>(5, "disabled", Some(7), &[])?;
+                assert_enum::<EnumRules, _>(5, "disabled", Some(0), &["not_in"])
             }
 
             // https://github.com/mathematic-inc/protovalidate-buffa/discussions/103
             #[test]
             fn ignore_rules_preserve_explicit_presence() -> Result<(), buffa::DecodeError> {
-                assert_enum::<EnumRules>(7, "ignored", Some(7), &[])?;
-                assert_enum::<EnumRules>(8, "zero", None, &[])?;
-                assert_enum::<EnumRules>(8, "zero", Some(0), &["not_in"])
+                assert_enum::<EnumRules, _>(7, "ignored", Some(7), &[])?;
+                assert_enum::<EnumRules, _>(8, "zero", None, &[])?;
+                assert_enum::<EnumRules, _>(8, "zero", Some(0), &["not_in"])
             }
 
             // https://github.com/mathematic-inc/protovalidate-buffa/discussions/103
             #[test]
             fn required_checks_presence_before_enum_rules() -> Result<(), buffa::DecodeError> {
-                assert_enum::<RequiredEnum>(1, "value", None, &["required"])?;
-                assert_enum::<RequiredEnum>(1, "value", Some(1), &[])?;
-                assert_enum::<RequiredEnum>(1, "value", Some(0), &["not_in"])?;
-                assert_enum::<RequiredEnum>(1, "value", Some(7), &$required_unknown)
+                assert_enum::<RequiredEnum, _>(1, "value", None, &["required"])?;
+                assert_enum::<RequiredEnum, _>(1, "value", Some(1), &[])?;
+                assert_enum::<RequiredEnum, _>(1, "value", Some(0), &["not_in"])?;
+                assert_enum::<RequiredEnum, _>(1, "value", Some(7), &$required_unknown)
             }
         }
     };

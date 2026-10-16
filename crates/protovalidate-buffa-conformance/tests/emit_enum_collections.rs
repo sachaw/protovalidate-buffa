@@ -22,10 +22,10 @@ use protovalidate_buffa::{FieldType, Subscript, Validate, ValidationError};
 
 include!(concat!(env!("OUT_DIR"), "/module_tree_mounts.rs"));
 
-fn results<M>(bytes: &[u8]) -> [Result<(), ValidationError>; 2]
+fn results<M, S>(bytes: &[u8]) -> [Result<(), ValidationError>; 2]
 where
-    M: HasMessageView + Validate,
-    for<'a> M::View<'a>: Validate,
+    M: HasMessageView + Validate<S>,
+    for<'a> M::View<'a>: Validate<S>,
 {
     let owned = M::decode_from_slice(bytes).expect("decode collection message");
     let view = M::View::decode_view(bytes).expect("decode collection view");
@@ -61,12 +61,12 @@ fn input(field: u32, value: i32) -> Vec<u8> {
     bytes
 }
 
-fn assert_rules<M>(field: u32, value: i32, expected: &[&str])
+fn assert_rules<M, S>(field: u32, value: i32, expected: &[&str])
 where
-    M: HasMessageView + Validate,
-    for<'a> M::View<'a>: Validate,
+    M: HasMessageView + Validate<S>,
+    for<'a> M::View<'a>: Validate<S>,
 {
-    for result in results::<M>(&input(field, value)) {
+    for result in results::<M, S>(&input(field, value)) {
         if expected.is_empty() {
             assert!(result.is_ok(), "field {field}, value {value}: {result:?}");
             continue;
@@ -151,12 +151,12 @@ macro_rules! collection_tests {
 
             #[test]
             fn defined_values_and_empty_collections_pass() {
-                for result in results::<EnumCollectionsDefined>(&[]) {
+                for result in results::<EnumCollectionsDefined, _>(&[]) {
                     assert!(result.is_ok());
                 }
                 for field in 1..=4 {
                     for value in [0, 1, -1] {
-                        assert_rules::<EnumCollectionsDefined>(field, value, &[]);
+                        assert_rules::<EnumCollectionsDefined, _>(field, value, &[]);
                     }
                 }
             }
@@ -165,7 +165,7 @@ macro_rules! collection_tests {
             fn undefined_positive_and_negative_numbers_report_locations() {
                 for field in 1..=4 {
                     for value in [99, -99, i32::MAX, i32::MIN] {
-                        assert_rules::<EnumCollectionsDefined>(field, value, &["defined_only"]);
+                        assert_rules::<EnumCollectionsDefined, _>(field, value, &["defined_only"]);
                     }
                 }
             }
@@ -174,30 +174,34 @@ macro_rules! collection_tests {
             fn disabled_and_absent_defined_only_preserve_not_in() {
                 for field in 1..=4 {
                     for value in [1, -1, 99, -99, i32::MAX, i32::MIN] {
-                        assert_rules::<EnumCollectionsDisabled>(field, value, &[]);
-                        assert_rules::<EnumCollectionsAbsent>(field, value, &[]);
+                        assert_rules::<EnumCollectionsDisabled, _>(field, value, &[]);
+                        assert_rules::<EnumCollectionsAbsent, _>(field, value, &[]);
                     }
-                    assert_rules::<EnumCollectionsDisabled>(field, 0, &["not_in"]);
-                    assert_rules::<EnumCollectionsAbsent>(field, 0, &["not_in"]);
+                    assert_rules::<EnumCollectionsDisabled, _>(field, 0, &["not_in"]);
+                    assert_rules::<EnumCollectionsAbsent, _>(field, 0, &["not_in"]);
                 }
             }
 
             #[test]
             fn combined_rules_report_each_applicable_violation() {
                 for field in 1..=4 {
-                    assert_rules::<EnumCollectionsCombined>(field, 1, &[]);
-                    assert_rules::<EnumCollectionsCombined>(field, 0, &["not_in"]);
-                    assert_rules::<EnumCollectionsCombined>(field, -99, &["defined_only"]);
-                    assert_rules::<EnumCollectionsCombined>(field, 99, &["defined_only", "not_in"]);
+                    assert_rules::<EnumCollectionsCombined, _>(field, 1, &[]);
+                    assert_rules::<EnumCollectionsCombined, _>(field, 0, &["not_in"]);
+                    assert_rules::<EnumCollectionsCombined, _>(field, -99, &["defined_only"]);
+                    assert_rules::<EnumCollectionsCombined, _>(
+                        field,
+                        99,
+                        &["defined_only", "not_in"],
+                    );
                 }
             }
 
             #[test]
             fn shared_enum_emission_preserves_const_and_in() {
-                assert_rules::<EnumCollectionsOtherRules>(1, 1, &[]);
-                assert_rules::<EnumCollectionsOtherRules>(1, 99, &["const"]);
-                assert_rules::<EnumCollectionsOtherRules>(3, 1, &[]);
-                assert_rules::<EnumCollectionsOtherRules>(3, 99, &["in"]);
+                assert_rules::<EnumCollectionsOtherRules, _>(1, 1, &[]);
+                assert_rules::<EnumCollectionsOtherRules, _>(1, 99, &["const"]);
+                assert_rules::<EnumCollectionsOtherRules, _>(3, 1, &[]);
+                assert_rules::<EnumCollectionsOtherRules, _>(3, 99, &["in"]);
             }
 
             #[test]

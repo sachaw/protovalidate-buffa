@@ -10,22 +10,29 @@
 //!
 //! Non-handler `async fn`s inside the same `impl` block are left alone
 //! (they lack a recognized request parameter, so the macro skips them).
+//!
+//! The validator set is inferred. When more than one set of validators for a
+//! request type is loaded, name the one to use:
+//! `#[connect_impl(set = acme_protovalidate::acme::v1::__Validators)]`.
 
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
 use quote::{quote, quote_spanned};
-use syn::{Error, FnArg, ImplItem, ItemImpl, PatType, Type, TypePath, parse_macro_input};
+use syn::{
+    Error, FnArg, ImplItem, ItemImpl, PatType, Token, Type, TypePath,
+    parse::{ParseStream, Parser as _},
+    parse_macro_input,
+};
 
 #[proc_macro_attribute]
 pub fn connect_impl(attr: TokenStream, input: TokenStream) -> TokenStream {
-    if !attr.is_empty() {
-        return Error::new_spanned(
-            TokenStream2::from(attr),
-            "protovalidate_buffa::connect_impl takes no arguments",
-        )
-        .to_compile_error()
-        .into();
-    }
+    let set = if attr.is_empty() {
+        quote! { _ }
+    } else {
+        match parse_set.parse(attr) {
+            Ok(set) => quote! { #set },
+            Err(error) => return error.to_compile_error().into(),
+        }
+    };
 
     let mut item = parse_macro_input!(input as ItemImpl);
 
@@ -40,7 +47,7 @@ pub fn connect_impl(attr: TokenStream, input: TokenStream) -> TokenStream {
                 RequestType::ServiceRequest => quote_spanned! {span=> #arg_ident.view() },
             };
             let validate: syn::Stmt = syn::parse_quote_spanned! {span=>
-                <_ as ::protovalidate_buffa::Validate>::validate(#view)
+                <_ as ::protovalidate_buffa::Validate<#set>>::validate(#view)
                     .map_err(::protovalidate_buffa::ValidationError::into_connect_error)?;
             };
 
@@ -49,6 +56,23 @@ pub fn connect_impl(attr: TokenStream, input: TokenStream) -> TokenStream {
     }
 
     TokenStream::from(quote! { #item })
+}
+
+/// Parse the optional `set = <validator set>` argument.
+fn parse_set(input: ParseStream<'_>) -> syn::Result<Type> {
+    let key: syn::Ident = input.parse()?;
+    if key != "set" {
+        return Err(Error::new(
+            key.span(),
+            "protovalidate_buffa::connect_impl accepts only `set = <validator set>`",
+        ));
+    }
+    input.parse::<Token![=]>()?;
+    let set = input.parse()?;
+    if !input.is_empty() {
+        return Err(input.error("unexpected tokens after the validator set"));
+    }
+    Ok(set)
 }
 
 enum RequestType {

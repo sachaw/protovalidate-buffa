@@ -963,12 +963,12 @@ impl Position {
     }
 }
 
-fn validation_results<M>(
+fn validation_results<M, S>(
     bytes: &[u8],
 ) -> Result<[Result<(), protovalidate_buffa::ValidationError>; 2], buffa::DecodeError>
 where
-    M: HasMessageView + Validate,
-    for<'a> M::View<'a>: Validate,
+    M: HasMessageView + Validate<S>,
+    for<'a> M::View<'a>: Validate<S>,
 {
     Ok([
         M::decode_from_slice(bytes)?.validate(),
@@ -976,12 +976,12 @@ where
     ])
 }
 
-fn violations<M>(bytes: &[u8]) -> Result<[Vec<Violation>; 2], buffa::DecodeError>
+fn violations<M, S>(bytes: &[u8]) -> Result<[Vec<Violation>; 2], buffa::DecodeError>
 where
-    M: HasMessageView + Validate,
-    for<'a> M::View<'a>: Validate,
+    M: HasMessageView + Validate<S>,
+    for<'a> M::View<'a>: Validate<S>,
 {
-    Ok(validation_results::<M>(bytes)?.map(|result| {
+    Ok(validation_results::<M, S>(bytes)?.map(|result| {
         result.err().map_or_else(Vec::new, |error| {
             assert!(error.compile_error.is_none(), "{error:?}");
             assert!(error.runtime_error.is_none(), "{error:?}");
@@ -1036,13 +1036,13 @@ fn rule_ids(violations: &[Violation]) -> Vec<&str> {
 
 /// Each case accepts its valid value and refuses its invalid one with one
 /// violation that names the field, the element, and the rule.
-fn assert_cases<M>(position: Position, syntax: &str) -> Result<(), buffa::DecodeError>
+fn assert_cases<M, S>(position: Position, syntax: &str) -> Result<(), buffa::DecodeError>
 where
-    M: HasMessageView + Validate,
-    for<'a> M::View<'a>: Validate,
+    M: HasMessageView + Validate<S>,
+    for<'a> M::View<'a>: Validate<S>,
 {
     // Monomorphization: the assertion loop is shared by every message type.
-    assert_cases_with(position, syntax, violations::<M>)
+    assert_cases_with(position, syntax, violations::<M, S>)
 }
 
 type ValidateWire = fn(&[u8]) -> Result<[Vec<Violation>; 2], buffa::DecodeError>;
@@ -1313,7 +1313,7 @@ macro_rules! collection_tests {
             #[test]
             fn custom_rules_compose_with_standard_rules_and_presence()
             -> Result<(), buffa::DecodeError> {
-                for violations in violations::<Composed>(&[])? {
+                for violations in violations::<Composed, _>(&[])? {
                     assert!(violations.is_empty());
                 }
                 for field in 1..=8 {
@@ -1331,7 +1331,7 @@ macro_rules! collection_tests {
                             },
                         ),
                     ] {
-                        for found in violations::<Composed>(&composed_input(field, value))? {
+                        for found in violations::<Composed, _>(&composed_input(field, value))? {
                             assert_eq!(rule_ids(&found), expected, "field {field}={value:?}");
                             for violation in found {
                                 assert_eq!(violation.for_key, field == 2);
@@ -1393,22 +1393,22 @@ macro_rules! collection_tests {
                 Str("bad").put(1, &mut child);
                 for position in 1..=4 {
                     let input = nested_input(position, &child);
-                    for result in validation_results::<SchemaParents>(&input)? {
+                    for result in validation_results::<SchemaParents, _>(&input)? {
                         let error = result.expect_err("nested schema must fail");
                         assert!(error.compile_error.is_some(), "{error:?}");
                     }
-                    for result in validation_results::<EvaluationParents>(&input)? {
+                    for result in validation_results::<EvaluationParents, _>(&input)? {
                         let error = result.expect_err("nested evaluation must fail");
                         assert!(error.runtime_error.is_some(), "{error:?}");
                     }
-                    for found in violations::<IgnoredChildren>(&input)? {
+                    for found in violations::<IgnoredChildren, _>(&input)? {
                         assert!(found.is_empty(), "{found:?}");
                     }
                 }
-                for found in violations::<IgnoredItemsSize>(&[])? {
+                for found in violations::<IgnoredItemsSize, _>(&[])? {
                     assert_eq!(rule_ids(&found), ["repeated.min_items"]);
                 }
-                for found in violations::<IgnoredItemsSize>(&nested_input(1, &child))? {
+                for found in violations::<IgnoredItemsSize, _>(&nested_input(1, &child))? {
                     assert!(found.is_empty());
                 }
                 Ok(())
@@ -1418,11 +1418,11 @@ macro_rules! collection_tests {
             #[test]
             fn invalid_nested_rule_types_report_schema_errors() -> Result<(), buffa::DecodeError> {
                 for results in [
-                    validation_results::<InvalidItemRules>(&[])?,
-                    validation_results::<InvalidKeyRules>(&[])?,
-                    validation_results::<InvalidValueRules>(&[])?,
-                    validation_results::<InvalidEncodedRules>(&[])?,
-                    validation_results::<InvalidUnique>(&[])?,
+                    validation_results::<InvalidItemRules, _>(&[])?,
+                    validation_results::<InvalidKeyRules, _>(&[])?,
+                    validation_results::<InvalidValueRules, _>(&[])?,
+                    validation_results::<InvalidEncodedRules, _>(&[])?,
+                    validation_results::<InvalidUnique, _>(&[])?,
                 ] {
                     for result in results {
                         let error = result.expect_err("invalid nested rule type");
@@ -1431,7 +1431,7 @@ macro_rules! collection_tests {
                 }
                 let mut ignored = Vec::new();
                 Str("invalid").put(1, &mut ignored);
-                for result in validation_results::<IgnoredInvalidRules>(&ignored)? {
+                for result in validation_results::<IgnoredInvalidRules, _>(&ignored)? {
                     assert!(result.is_ok(), "{result:?}");
                 }
                 Ok(())
@@ -1456,7 +1456,7 @@ macro_rules! collection_tests {
                                 Double(f64::from(value)).put(field, &mut input);
                             }
                         }
-                        for found in violations::<UniqueNumbers>(&input)? {
+                        for found in violations::<UniqueNumbers, _>(&input)? {
                             assert_eq!(found.is_empty(), valid, "{values:?}: {found:?}");
                             if !valid {
                                 assert_eq!(rule_ids(&found), ["repeated.unique"]);
@@ -1487,7 +1487,7 @@ macro_rules! collection_tests {
                         } else {
                             Wire::Enum(value).put(field, &mut input);
                         }
-                        for found in violations::<IgnoreEnums>(&input)? {
+                        for found in violations::<IgnoreEnums, _>(&input)? {
                             let valid = value == 2 || field <= 2;
                             assert_eq!(
                                 found.is_empty(),
@@ -1506,55 +1506,55 @@ macro_rules! collection_tests {
             // https://github.com/mathematic-inc/protovalidate-buffa/discussions/114
             #[test]
             fn every_rule_in_singular() -> Result<(), buffa::DecodeError> {
-                assert_cases::<Singular>(Position::Singular, stringify!($syntax))
+                assert_cases::<Singular, _>(Position::Singular, stringify!($syntax))
             }
 
             // https://github.com/mathematic-inc/protovalidate-buffa/discussions/114
             #[test]
             fn every_rule_in_presence() -> Result<(), buffa::DecodeError> {
-                assert_cases::<PresenceAll>(Position::Presence, stringify!($syntax))
+                assert_cases::<PresenceAll, _>(Position::Presence, stringify!($syntax))
             }
 
             // https://github.com/mathematic-inc/protovalidate-buffa/discussions/114
             #[test]
             fn every_rule_in_oneof() -> Result<(), buffa::DecodeError> {
-                assert_cases::<Oneofs>(Position::Oneof, stringify!($syntax))
+                assert_cases::<Oneofs, _>(Position::Oneof, stringify!($syntax))
             }
 
             // https://github.com/mathematic-inc/protovalidate-buffa/discussions/114
             #[test]
             fn every_rule_in_wrappers() -> Result<(), buffa::DecodeError> {
-                assert_cases::<WrappersAll>(Position::Wrappers, stringify!($syntax))
+                assert_cases::<WrappersAll, _>(Position::Wrappers, stringify!($syntax))
             }
 
             // https://github.com/mathematic-inc/protovalidate-buffa/discussions/114
             #[test]
             fn every_rule_in_wrapperitems() -> Result<(), buffa::DecodeError> {
-                assert_cases::<WrapperItems>(Position::WrapperItems, stringify!($syntax))
+                assert_cases::<WrapperItems, _>(Position::WrapperItems, stringify!($syntax))
             }
 
             // https://github.com/mathematic-inc/protovalidate-buffa/discussions/114
             #[test]
             fn every_rule_in_wrappervalues() -> Result<(), buffa::DecodeError> {
-                assert_cases::<WrapperValues>(Position::WrapperValues, stringify!($syntax))
+                assert_cases::<WrapperValues, _>(Position::WrapperValues, stringify!($syntax))
             }
 
             // https://github.com/mathematic-inc/protovalidate-buffa/discussions/114
             #[test]
             fn standard_rules_apply_to_items() -> Result<(), buffa::DecodeError> {
-                assert_cases::<Items>(Position::Items, stringify!($syntax))
+                assert_cases::<Items, _>(Position::Items, stringify!($syntax))
             }
 
             // https://github.com/mathematic-inc/protovalidate-buffa/discussions/114
             #[test]
             fn standard_rules_apply_to_map_keys() -> Result<(), buffa::DecodeError> {
-                assert_cases::<Keys>(Position::Keys, stringify!($syntax))
+                assert_cases::<Keys, _>(Position::Keys, stringify!($syntax))
             }
 
             // https://github.com/mathematic-inc/protovalidate-buffa/discussions/114
             #[test]
             fn standard_rules_apply_to_map_values() -> Result<(), buffa::DecodeError> {
-                assert_cases::<Values>(Position::Values, stringify!($syntax))
+                assert_cases::<Values, _>(Position::Values, stringify!($syntax))
             }
 
             // https://github.com/mathematic-inc/protovalidate-buffa/discussions/114
@@ -1563,7 +1563,7 @@ macro_rules! collection_tests {
                 let mut bytes = Vec::new();
                 Double(f64::NEG_INFINITY).put(1, &mut bytes);
                 Double(f64::NEG_INFINITY).put(2, &mut bytes);
-                for violations in violations::<ItemMessages>(&bytes)? {
+                for violations in violations::<ItemMessages, _>(&bytes)? {
                     let (single, items): (Vec<_>, Vec<_>) = violations
                         .iter()
                         .partition(|v| v.field.elements[0].field_number == Some(1));
@@ -1589,7 +1589,7 @@ macro_rules! collection_tests {
                 ] {
                     let mut bytes = Vec::new();
                     Str(value).put(1, &mut bytes);
-                    for violations in violations::<ItemCel>(&bytes)? {
+                    for violations in violations::<ItemCel, _>(&bytes)? {
                         assert_eq!(rule_ids(&violations), expected, "{value:?}");
                     }
                 }
@@ -1613,7 +1613,7 @@ macro_rules! collection_tests {
                     for (number, value) in (1..).zip(values) {
                         value.put(number, &mut bytes);
                     }
-                    for violations in violations::<Presence>(&bytes)? {
+                    for violations in violations::<Presence, _>(&bytes)? {
                         assert_eq!(rule_ids(&violations), expected, "{values:?}");
                     }
                 }
@@ -1657,7 +1657,7 @@ macro_rules! collection_tests {
                         value.put(1, &mut wrapper);
                         put_len(number, &wrapper, &mut bytes);
                     }
-                    for violations in violations::<Wrappers>(&bytes)? {
+                    for violations in violations::<Wrappers, _>(&bytes)? {
                         assert_eq!(rule_ids(&violations), expected, "{values:?}");
                         assert!(violations.iter().all(|v| !v.for_key));
                     }

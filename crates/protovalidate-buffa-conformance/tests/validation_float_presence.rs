@@ -43,7 +43,7 @@ fn push_value(bytes: &mut Vec<u8>, number: u8, kind: FieldType, value: f64) {
 
 /// Raw wire input preserves explicit zero and NaN. Repeated cases prepend
 /// valid elements so the failing index must survive both decoding paths.
-fn assert_float<M>(
+fn assert_float<M, S>(
     number: u8,
     name: &str,
     kind: FieldType,
@@ -52,8 +52,8 @@ fn assert_float<M>(
     expected: &[&str],
 ) -> Result<(), buffa::DecodeError>
 where
-    M: HasMessageView + Validate,
-    for<'a> M::View<'a>: Validate,
+    M: HasMessageView + Validate<S>,
+    for<'a> M::View<'a>: Validate<S>,
 {
     let mut bytes = Vec::new();
     if let Some(value) = value {
@@ -143,7 +143,7 @@ macro_rules! presence_tests {
                     (3, "float_items", Float, Some(1)),
                     (4, "double_items", Double, Some(1)),
                 ] {
-                    assert_float::<FiniteRules>(number, name, kind, None, index, &[])?;
+                    assert_float::<FiniteRules, _>(number, name, kind, None, index, &[])?;
                     for value in [
                         0.0,
                         -0.0,
@@ -152,7 +152,7 @@ macro_rules! presence_tests {
                         f64::from(f32::MAX),
                         f64::from(f32::MIN_POSITIVE),
                     ] {
-                        assert_float::<FiniteRules>(number, name, kind, Some(value), index, &[])?;
+                        assert_float::<FiniteRules, _>(number, name, kind, Some(value), index, &[])?;
                     }
                 }
                 Ok(())
@@ -168,7 +168,7 @@ macro_rules! presence_tests {
                     (4, "double_items", Double, Some(1)),
                 ] {
                     for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-                        assert_float::<FiniteRules>(
+                        assert_float::<FiniteRules, _>(
                             number,
                             name,
                             kind,
@@ -190,9 +190,9 @@ macro_rules! presence_tests {
                     (7, "float_bound_items", Float, Some(1), "gte"),
                     (8, "double_bound_items", Double, Some(1), "gte"),
                 ] {
-                    assert_float::<FiniteRules>(number, name, kind, Some(1.0), index, &[])?;
-                    assert_float::<FiniteRules>(number, name, kind, Some(-1.0), index, &[bound])?;
-                    assert_float::<FiniteRules>(
+                    assert_float::<FiniteRules, _>(number, name, kind, Some(1.0), index, &[])?;
+                    assert_float::<FiniteRules, _>(number, name, kind, Some(-1.0), index, &[bound])?;
+                    assert_float::<FiniteRules, _>(
                         number,
                         name,
                         kind,
@@ -201,7 +201,7 @@ macro_rules! presence_tests {
                         &["finite"],
                     )?;
                     for value in [f64::NAN, f64::NEG_INFINITY] {
-                        assert_float::<FiniteRules>(
+                        assert_float::<FiniteRules, _>(
                             number,
                             name,
                             kind,
@@ -226,7 +226,7 @@ macro_rules! presence_tests {
                     (16, "double_ignored_items", Double, Some(1)),
                 ] {
                     for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-                        assert_float::<FiniteRules>(number, name, kind, Some(value), index, &[])?;
+                        assert_float::<FiniteRules, _>(number, name, kind, Some(value), index, &[])?;
                     }
                 }
                 Ok(())
@@ -242,14 +242,14 @@ macro_rules! presence_tests {
                     (17, "float_zero_items", Float, Some(1)),
                     (18, "double_zero_items", Double, Some(1)),
                 ] {
-                    assert_float::<FiniteRules>(number, name, kind, None, index, &[])?;
+                    assert_float::<FiniteRules, _>(number, name, kind, None, index, &[])?;
                     let zero_rules = if index.is_some() {
                         &[][..]
                     } else {
                         &["gt"][..]
                     };
-                    assert_float::<FiniteRules>(number, name, kind, Some(0.0), index, zero_rules)?;
-                    assert_float::<FiniteRules>(
+                    assert_float::<FiniteRules, _>(number, name, kind, Some(0.0), index, zero_rules)?;
+                    assert_float::<FiniteRules, _>(
                         number,
                         name,
                         kind,
@@ -257,7 +257,7 @@ macro_rules! presence_tests {
                         index,
                         &["finite"],
                     )?;
-                    assert_float::<FiniteRules>(
+                    assert_float::<FiniteRules, _>(
                         number,
                         name,
                         kind,
@@ -289,10 +289,10 @@ fn implicit_presence_and_repeated_fields_enforce_finite() -> Result<(), buffa::D
         (3, "float_items", Float, Some(1)),
         (4, "double_items", Double, Some(1)),
     ] {
-        assert_float::<ImplicitFinite>(number, name, kind, None, index, &[])?;
-        assert_float::<ImplicitFinite>(number, name, kind, Some(0.0), index, &[])?;
+        assert_float::<ImplicitFinite, _>(number, name, kind, None, index, &[])?;
+        assert_float::<ImplicitFinite, _>(number, name, kind, Some(0.0), index, &[])?;
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert_float::<ImplicitFinite>(number, name, kind, Some(value), index, &["finite"])?;
+            assert_float::<ImplicitFinite, _>(number, name, kind, Some(value), index, &["finite"])?;
         }
     }
     Ok(())
