@@ -3,7 +3,8 @@
 Static-codegen [protovalidate] for the [buffa] Rust protobuf runtime.
 
 Annotate your `.proto` messages with `(buf.validate.*)` rules; a codegen plugin
-emits pure-Rust `impl Validate` blocks per message. Handlers call
+emits pure-Rust `Validate` impls per message, in the crate that holds your
+buffa types or in a crate of their own. Handlers call
 `req.validate()?` at entry (or use the `#[connect_impl]` macro to do it
 automatically on every handler in a service impl).
 
@@ -83,7 +84,7 @@ Compared to reflection-based implementations, the codegen approach has two chara
 |-------|---------|
 | [`protovalidate-buffa`](crates/protovalidate-buffa/) | Runtime library: `Validate` trait, structured `ValidationError` (with typed `compile_error` / `runtime_error` slots), `Violation` / `FieldPath`, rule helpers, `CelScalar` widening trait + Duration/Timestamp helpers, Connect error adapter. CEL rules are transpiled to native Rust at codegen time, so the runtime carries no interpreter. |
 | [`protovalidate-buffa-macros`](crates/protovalidate-buffa-macros/) | `#[connect_impl]` attribute macro — inserts request validation at the top of every handler in a service `impl` block. Re-exported from the runtime crate. |
-| [`protoc-gen-protovalidate-buffa`](crates/protoc-gen-protovalidate-buffa/) | Codegen plugin. Reads `(buf.validate.*)` extensions off descriptors via buffa's `ExtensionSet`, emits `impl Validate for Foo` blocks. Wire into `buf.gen.yaml`. |
+| [`protoc-gen-protovalidate-buffa`](crates/protoc-gen-protovalidate-buffa/) | Codegen plugin. Reads `(buf.validate.*)` extensions off descriptors via buffa's `ExtensionSet`, emits `Validate` impls for each message and view. Wire into `buf.gen.yaml`. |
 | [`protovalidate-buffa-protos`](crates/protovalidate-buffa-protos/) | Checked-in Buffa types for `buf/validate/validate.proto`, shared by the codegen plugin and structured runtime errors. |
 
 `protovalidate-buffa-conformance` also lives in this workspace but is private
@@ -230,6 +231,67 @@ Code that previously constructed `Options` with only `proto_module` must add
 Two [runnable examples](examples/packaging/) demonstrate per-source output and
 per-package output with an enum from another package. Both
 exercise validation on owned messages and borrowed views.
+
+### Validators in their own crate
+
+Validators can live in a crate of their own that depends on a buffa types
+crate, such as a Buffer Schema Registry SDK. Map each protobuf package to the
+Rust path of its types with `extern_path`, as for connectrpc:
+
+```yaml
+- local: protoc-gen-protovalidate-buffa
+  out: crates/acme-protovalidate/src
+  strategy: all
+  opt:
+    - packaging=false
+    - file_per_package=true
+    - extern_path=.acme=::acme_buffa::acme
+    - extern_path=.geo=::geo_buffa::geo # a dependency module
+```
+
+`extern_path=.=<path>` (or `buffa_module=<path>`) maps every package. With
+`extern_path`, files are named `<package>.rs`; mount them in the same nested
+`pub mod` tree as the types. Every type the validators name must be covered,
+or generation fails with the missing mapping.
+
+Each generated file declares a hidden marker type, `__Validators`, and
+implements `Validate<__Validators>` for its messages and views. The marker is
+local to the validator crate, so the impls are allowed even though the types
+are not. Call sites infer it: `request.validate()` and `#[connect_impl]` read
+the same as before.
+
+Rust only loads a dependency that is referenced. **Load the validator crate
+once, at your crate root:**
+
+```rust
+use acme_protovalidate as _;
+```
+
+Without it, validation fails to compile with a note saying the same. Importing
+anything from the crate also loads it, as does depending on a crate that
+references it.
+
+A message that embeds a message from another module (outside the generate
+set, such as `geo` above) validates it with rules the plugin copies into the
+generated file, so the validator crate never depends on another validator
+crate. Only messages that carry rules, directly or through their fields, are
+copied, and only those reachable from each file. The copies use a private
+trait, so they never make a call ambiguous. Use `strategy: all` so the files
+of one module are generated together rather than copied into each other.
+
+If two validator sets for the same type are loaded, for example an SDK and a
+local regeneration, inference reports the ambiguity (`E0283`). Choose one:
+
+```rust
+Validate::<acme_protovalidate::acme::v1::__Validators>::validate(&request)?;
+
+#[connect_impl(set = acme_protovalidate::acme::v1::__Validators)]
+impl AcmeService for Server { /* ... */ }
+```
+
+Generic code takes the set as a type parameter, `fn check<M: Validate<S>, S>`,
+or stores the type-erased `protovalidate_buffa::validator::<M, _>()` function
+pointer. See the [separate-crate example](examples/separate-crate/).
 
 ### Annotate and validate a request
 
