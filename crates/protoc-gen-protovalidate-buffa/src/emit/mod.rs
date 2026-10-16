@@ -27,18 +27,32 @@ use crate::scan::MessageValidators;
 /// };
 /// let files = emit::render_with_options(&[], &options)?;
 /// assert!(files.is_empty());
+///
+/// // Validators in their own crate, for types generated elsewhere.
+/// let options = Options::parse("packaging=false,extern_path=.acme=::acme_types::acme")?;
+/// assert_eq!(options.extern_paths, [(".acme".to_string(), "::acme_types::acme".to_string())]);
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// Rust module path under which the protobuf message types live —
-    /// the `mod.rs` packaging file emits `pub(crate) use <proto_module>::<pkg>::*;`
-    /// inside each leaf package so local and cross-package type names resolve.
-    /// Ignored when [`Self::packaging`] is `false`.
+    /// Rust module path under which the protobuf message types live, when
+    /// [`Self::packaging`] is `true`. Equivalent to an
+    /// `extern_path=.=<proto_module>` catch-all; an explicit `.` entry in
+    /// [`Self::extern_paths`] takes precedence. Ignored when
+    /// [`Self::packaging`] is `false`.
     pub proto_module: String,
+    /// Where buffa generated the message types, as `(proto path, Rust path)`
+    /// pairs: `(".acme", "::acme_types::acme")` maps package `acme` and its
+    /// subpackages, `(".", "crate::proto")` maps everything. Same semantics
+    /// and longest-prefix matching as buffa's and connectrpc's
+    /// `extern_path`. When set with [`Self::packaging`] `false`, validators
+    /// can live in a different crate from the types, and every validated
+    /// type must be covered.
+    pub extern_paths: Vec<(String, String)>,
     /// Emit the `mod.rs` and `<package>.mod.rs` module files (default: `true`).
-    /// Set to `false` to emit only validators with a `.validate.rs` suffix,
-    /// for inclusion in the same module as the message types.
+    /// Set to `false` to emit only validator files. Without
+    /// [`Self::extern_paths`] they get a `.validate.rs` suffix, for inclusion
+    /// in the same module as the message types.
     pub packaging: bool,
     /// Merge validators by declared protobuf package (default: `false`).
     /// When `false`, emit one validator file per source proto. When `true`,
@@ -48,12 +62,91 @@ pub struct Options {
 }
 
 impl Options {
+    /// Parse a plugin parameter string: comma-separated `key=value` or bare
+    /// `flag` entries, as protoc and buf pass them.
+    ///
+    /// Recognized keys are `packaging`, `file_per_package`, `proto_module`,
+    /// `buffa_module` (shorthand for `extern_path=.=<path>`) and the
+    /// repeatable `extern_path=<.proto.path>=<rust path>`. Other keys are
+    /// ignored, so callers can pass forward-compatible options (and options
+    /// the scan phase reads, such as `idiomatic_field_names`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-boolean `packaging` / `file_per_package`
+    /// value or a malformed `extern_path` / `buffa_module`.
+    pub fn parse(parameter: &str) -> Result<Self> {
+        let mut opts = Self::default();
+        for part in parameter.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (key, value) = part.split_once('=').unwrap_or((part, "true"));
+            match key.trim() {
+                "proto_module" if part.contains('=') => {
+                    opts.proto_module = value.trim().to_string();
+                }
+                "buffa_module" => {
+                    let rust = value.trim();
+                    if !part.contains('=') || rust.is_empty() {
+                        anyhow::bail!(
+                            "buffa_module requires a non-empty path, e.g. buffa_module=crate::proto"
+                        );
+                    }
+                    opts.extern_paths.push((".".to_string(), rust.to_string()));
+                }
+                "extern_path" => {
+                    let (proto, rust) = value
+                        .split_once('=')
+                        .map(|(proto, rust)| (proto.trim(), rust.trim()))
+                        .filter(|(proto, rust)| !proto.is_empty() && !rust.is_empty())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "invalid extern_path {value:?}, expected \
+                                 extern_path=.proto.pkg=::rust::path"
+                            )
+                        })?;
+                    let proto = if proto.starts_with('.') {
+                        proto.to_string()
+                    } else {
+                        format!(".{proto}")
+                    };
+                    opts.extern_paths.push((proto, rust.to_string()));
+                }
+                key @ ("packaging" | "file_per_package") => {
+                    let enabled = match value.trim() {
+                        "true" => true,
+                        "false" => false,
+                        value => anyhow::bail!("{key} must be true or false, got {value:?}"),
+                    };
+                    match key {
+                        "packaging" => opts.packaging = enabled,
+                        _ => opts.file_per_package = enabled,
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(opts)
+    }
+
     /// The `extern_path` mappings type resolution runs with.
     fn effective_extern_paths(&self) -> Vec<(String, String)> {
-        if self.packaging {
-            vec![(".".to_string(), self.proto_module.clone())]
+        let mut paths = self.extern_paths.clone();
+        if self.packaging && !paths.iter().any(|(proto, _)| proto == ".") {
+            paths.push((".".to_string(), self.proto_module.clone()));
+        }
+        paths
+    }
+
+    /// The suffix of validator file names.
+    const fn file_suffix(&self) -> &'static str {
+        if self.packaging || !self.extern_paths.is_empty() {
+            ".rs"
         } else {
-            Vec::new()
+            // Shares a directory and module with Buffa's `<stem>.rs`.
+            ".validate.rs"
         }
     }
 }
@@ -62,6 +155,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             proto_module: "crate::proto".to_string(),
+            extern_paths: Vec::new(),
             packaging: true,
             file_per_package: false,
         }
@@ -302,7 +396,9 @@ fn render_set(
 ) -> Result<Vec<File>> {
     let mut config = buffa_codegen::CodeGenConfig::default();
     config.extern_paths = opts.effective_extern_paths();
-    let types = types::Types::new(descriptors, to_generate, &config, false);
+    // Validators that are not beside the types can only name them absolutely.
+    let require_absolute = !config.extern_paths.is_empty();
+    let types = types::Types::new(descriptors, to_generate, &config, require_absolute);
 
     let mut groups: BTreeMap<&str, Vec<&MessageValidators>> = BTreeMap::new();
     for m in messages {
@@ -337,11 +433,7 @@ fn render_set(
         } else {
             key.trim_end_matches(".proto").replace('/', ".")
         };
-        let path = if opts.packaging {
-            format!("{stem}.rs")
-        } else {
-            format!("{stem}.validate.rs")
-        };
+        let path = format!("{stem}{}", opts.file_suffix());
         let body_str = body.to_string();
         let parsed = syn::parse2(body.clone()).map_err(|e| {
             anyhow::anyhow!("syn parse failed for {key}: {e}\n--- BEGIN TOKENS ---\n{body_str}\n--- END TOKENS ---")
