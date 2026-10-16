@@ -76,7 +76,8 @@ fn flat_output_merges_declared_packages_and_includes_owned_and_view_impls() {
     {
         let content = file.content.as_deref().unwrap();
         syn::parse_file(content).expect("valid Rust syntax");
-        assert_eq!(content.matches("use super::*;").count(), 1);
+        // Beside Buffa's types, validators name them relative to the package.
+        assert!(!content.contains("use super::*;"));
         for name in types {
             assert!(content.contains(&format!("Validate for {name}")));
             assert!(content.contains(&format!("__buffa::view::{name}View<'_>")));
@@ -262,8 +263,8 @@ fn packaging_and_file_per_package_are_independent() {
         }
         if parameter == "packaging=true,file_per_package=true" {
             let package = response.file[0].content.as_deref().unwrap();
-            assert!(package.contains("Validate for First"));
-            assert!(package.contains("Validate for Second"));
+            assert!(package.contains("Validate for crate::proto::example::v1::First"));
+            assert!(package.contains("Validate for crate::proto::example::v1::Second"));
             assert!(
                 response.file[2]
                     .content

@@ -221,9 +221,9 @@ pub enum SchemaFieldKind {
     /// A real oneof alternative has presence even when its value is default.
     Oneof {
         accessor: String,
-        /// Package of the message declaring the oneof, if it is named and
-        /// not the validators' own.
-        package: Option<String>,
+        /// Path to the package module declaring the message; empty when it
+        /// is the module the validator is emitted in.
+        root: String,
         /// Package-relative name of the message declaring the oneof.
         parent_msg_name: String,
         enumeration: String,
@@ -4285,14 +4285,14 @@ fn select_message_field(
     let access = match &entry.kind {
         SchemaFieldKind::Oneof {
             accessor,
-            package,
+            root,
             parent_msg_name,
             enumeration,
             variant,
             alternative_kind,
         } => {
             let variant = super::oneof::variant_path(
-                package.as_deref(),
+                root,
                 parent_msg_name,
                 enumeration,
                 variant,
@@ -4493,7 +4493,7 @@ fn has_message_field(
     let tokens = match &entry.kind {
         SchemaFieldKind::Oneof {
             accessor,
-            package,
+            root,
             parent_msg_name,
             enumeration,
             variant,
@@ -4501,7 +4501,7 @@ fn has_message_field(
         } => {
             let accessor = crate::emit::field_ident(accessor);
             let variant = super::oneof::variant_path(
-                package.as_deref(),
+                root,
                 parent_msg_name,
                 enumeration,
                 variant,
@@ -4584,7 +4584,7 @@ mod tests {
                     ty: CelType::Dyn,
                     kind: SchemaFieldKind::Oneof {
                         accessor: "origin".to_owned(),
-                        package: None,
+                        root: String::new(),
                         parent_msg_name: "Batch.Source".to_owned(),
                         enumeration: "Origin".to_owned(),
                         variant: "Produced".to_owned(),

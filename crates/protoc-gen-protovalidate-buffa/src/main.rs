@@ -8,7 +8,7 @@ use buffa_codegen::generated::{
     compiler::{CodeGeneratorRequest, CodeGeneratorResponse},
     descriptor::Edition,
 };
-use protoc_gen_protovalidate_buffa::{emit, scan};
+use protoc_gen_protovalidate_buffa::emit;
 
 fn main() -> anyhow::Result<()> {
     let mut input = Vec::new();
@@ -40,8 +40,7 @@ fn run(
     request: &CodeGeneratorRequest,
 ) -> anyhow::Result<Vec<buffa_codegen::generated::compiler::code_generator_response::File>> {
     let opts = parse_opts(request.parameter.as_deref().unwrap_or(""))?;
-    let validators = scan::gather(request)?;
-    emit::render_with_options(&validators, &opts)
+    emit::render_request(request, &opts)
 }
 
 /// Parse the `opt: [...]` parameters passed via `buf.gen.yaml`. Accepts a

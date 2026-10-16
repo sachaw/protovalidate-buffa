@@ -1062,11 +1062,13 @@ fn emit_enum_value(
     site: &RuleSite,
     e: &EnumStandard,
     full_name: &str,
+    scope: &crate::emit::Scope<'_>,
 ) -> Result<Vec<TokenStream>> {
     emit_enum_checks(
         value,
         e,
         full_name,
+        scope,
         &site.field_path(),
         |inner, inner_num, ty| site.rule("enum", 16, inner, inner_num, ty),
     )
@@ -1078,6 +1080,7 @@ fn emit_enum_checks(
     value: &TokenStream,
     e: &EnumStandard,
     full_name: &str,
+    scope: &crate::emit::Scope<'_>,
     field_path: &TokenStream,
     rule_path: impl Fn(&str, i32, &str) -> TokenStream,
 ) -> Result<Vec<TokenStream>> {
@@ -1106,7 +1109,7 @@ fn emit_enum_checks(
     }
 
     if e.defined_only == Some(true) {
-        let enum_type = resolve_local_type(full_name)?;
+        let enum_type = scope.enum_type(full_name)?;
         let field = field_path;
         let rule = rule_path("defined_only", 2, "Bool");
         out.push(quote! {
@@ -1171,105 +1174,6 @@ fn emit_enum_checks(
     }
 
     Ok(out)
-}
-
-/// Resolve a proto fully-qualified name to a local Rust type path.
-///
-/// E.g. `"example.v1.Foo"` → `syn::Path` for `ClothingType` (the last
-/// segment). The generated file is included inside the correct module so the
-/// local name resolves via the `use super::*;` at the top of the file.
-///
-/// Nested types (e.g. `"example.v1.Outer.InnerEnum"`) resolve through
-/// [`resolve_type_from_package`], which lowers parent PascalCase segments
-/// into the snake_case module names buffa emits (`outer::InnerEnum`).
-fn resolve_local_type(full_name: &str) -> Result<syn::Path> {
-    resolve_type_from_package(full_name, "")
-}
-
-/// Resolve a proto fully-qualified type name into the Rust path that's valid
-/// from within `cur_package`'s module. Buffa places each proto package at
-/// `crate::<pkg_segments_separated_by_::>`, with nested message/enum parents
-/// lowered into snake_case modules. `cur_package` is the current proto
-/// package (e.g. `buf.validate.conformance.cases`). If the target type lives
-/// in a descendant or sibling package, the returned path walks through the
-/// appropriate module segments.
-fn resolve_type_from_package(full_name: &str, cur_package: &str) -> Result<syn::Path> {
-    let stripped = full_name.strip_prefix('.').unwrap_or(full_name);
-    let segments: Vec<&str> = stripped.split('.').collect();
-    if segments.is_empty() {
-        anyhow::bail!("empty type name: {full_name:?}");
-    }
-
-    // Split into (package_segments, type_segments). Walk from the end; every
-    // trailing PascalCase segment is a type; the rest is the package.
-    let split = segments
-        .iter()
-        .rposition(|s| !s.chars().next().is_some_and(char::is_uppercase))
-        .map_or(0, |i| i + 1);
-    let pkg_segments: &[&str] = &segments[..split];
-    let type_segments: &[&str] = &segments[split..];
-    if type_segments.is_empty() {
-        anyhow::bail!("no type segment in: {full_name:?}");
-    }
-
-    // Determine the relative package path from cur_package to target package.
-    let cur: Vec<&str> = if cur_package.is_empty() {
-        Vec::new()
-    } else {
-        cur_package.split('.').collect()
-    };
-    let common = cur
-        .iter()
-        .zip(pkg_segments.iter())
-        .take_while(|(a, b)| a == b)
-        .count();
-    // Buffa's module structure: each package segment is its own `pub mod`.
-    // If target is a descendant of current, we walk down. If a sibling /
-    // ancestor, we'd need to walk up — but from inside a package module
-    // the parent modules are accessible (the package module is inside `buf::...`),
-    // however `use super::*;` brings only the immediate parent's items into
-    // scope. A safer approach: always reference via absolute `crate::...`.
-    // But our emitted code uses `use super::*;` and we don't know what path
-    // `crate` points to from the consumer's perspective. As a workaround,
-    // prefer descending references via package module names when the target
-    // is deeper, and otherwise emit a relative path that goes up through
-    // `super::`.
-    let mut path = String::new();
-    let descend = &pkg_segments[common..];
-    let ascend_count = cur.len() - common;
-    for _ in 0..ascend_count {
-        path.push_str("super::");
-    }
-    for seg in descend {
-        path.push_str(seg);
-        path.push_str("::");
-    }
-    let last_idx = type_segments.len() - 1;
-    for (i, s) in type_segments.iter().enumerate() {
-        if i == last_idx {
-            path.push_str(s);
-        } else {
-            path.push_str(&to_snake_case(s));
-            path.push_str("::");
-        }
-    }
-    syn::parse_str::<syn::Path>(&path).map_err(Into::into)
-}
-
-fn to_snake_case(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = String::with_capacity(s.len() + 2);
-    for (i, &c) in chars.iter().enumerate() {
-        if c.is_uppercase() && i > 0 {
-            let prev = chars[i - 1];
-            let next_is_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
-            if prev.is_lowercase() || (prev.is_uppercase() && next_is_lower) {
-                out.push('_');
-            }
-        }
-        out.push(c.to_ascii_lowercase());
-    }
-    out
 }
 
 /// Metadata describing a numeric rule family (e.g. int32, sint32, ...).
@@ -1378,6 +1282,7 @@ pub(super) fn emit_scalar_rules(
     kind: &FieldKind,
     std: &crate::scan::StandardRules,
     site: &RuleSite,
+    scope: &crate::emit::Scope<'_>,
 ) -> Result<Vec<TokenStream>> {
     let checks = match kind {
         FieldKind::String => std
@@ -1413,7 +1318,7 @@ pub(super) fn emit_scalar_rules(
         FieldKind::Enum { full_name } => std
             .enum_rules
             .as_ref()
-            .map(|e| emit_enum_value(value, site, e, full_name))
+            .map(|e| emit_enum_value(value, site, e, full_name, scope))
             .transpose()?,
         FieldKind::Message { .. }
         | FieldKind::Repeated(_)

@@ -25,8 +25,7 @@ use crate::scan::{FieldKind, FieldValidator, Ignore};
 )]
 pub(crate) fn emit(
     field: &FieldValidator,
-    schemas: &crate::emit::cel::SchemaIndex,
-    shape: crate::emit::Shape,
+    scope: &crate::emit::Scope<'_>,
 ) -> Result<TokenStream> {
     if matches!(field.ignore, Ignore::Always) {
         return Ok(quote! {});
@@ -68,7 +67,7 @@ pub(crate) fn emit(
                 kind_to_field_type(inner),
                 field.standard.repeated.as_ref().unwrap_or(&default),
                 inner,
-                schemas,
+                scope,
             )?);
         }
         FieldKind::Map { key, value } => {
@@ -78,7 +77,7 @@ pub(crate) fn emit(
                 keys: None,
                 values: None,
             };
-            let map = shape.map_access(&accessor, field.field_number);
+            let map = scope.shape.map_access(&accessor, field.field_number);
             blocks.push(super::repeated::emit_map(
                 &map,
                 name_lit,
@@ -86,7 +85,7 @@ pub(crate) fn emit(
                 field.standard.map.as_ref().unwrap_or(&default),
                 key,
                 value,
-                schemas,
+                scope,
             )?);
         }
         FieldKind::Optional(inner) => {
@@ -97,7 +96,7 @@ pub(crate) fn emit(
                 Some(field),
                 &site,
                 super::value::Presence::Explicit,
-                schemas,
+                scope,
             )?;
             let access = if matches!(inner.as_ref(), FieldKind::String | FieldKind::Bytes) {
                 quote! { self.#accessor.as_deref() }
@@ -115,7 +114,7 @@ pub(crate) fn emit(
                 Some(field),
                 &site,
                 super::value::Presence::Explicit,
-                schemas,
+                scope,
             )?;
             blocks.push(quote! { if let Some(inner) = self.#accessor.as_option() { #checks } });
         }
@@ -128,7 +127,7 @@ pub(crate) fn emit(
                 Some(field),
                 &site,
                 super::value::Presence::Explicit,
-                schemas,
+                scope,
             )?);
         }
     }
@@ -146,8 +145,8 @@ pub(crate) fn emit(
             &field.field_type,
             field,
             &site,
-            schemas,
-            super::cel::collection_binding(field, &accessor, schemas, shape).as_ref(),
+            scope.schemas,
+            super::cel::collection_binding(field, &accessor, scope.schemas, scope.shape).as_ref(),
         ));
     }
 

@@ -24,7 +24,7 @@ pub(super) fn emit(
     rules: Option<&FieldValidator>,
     site: &RuleSite,
     presence: Presence,
-    schemas: &cel::SchemaIndex,
+    scope: &crate::emit::Scope<'_>,
 ) -> Result<TokenStream> {
     if rules.is_some_and(|r| r.ignore == Ignore::Always) {
         return Ok(TokenStream::new());
@@ -57,19 +57,21 @@ pub(super) fn emit(
                 inner,
                 &rules.standard,
                 site,
+                scope,
             )?);
         }
         checks.extend(emit_custom(
             inner,
             rules,
             site,
-            schemas,
-            cel::this_binding_for_kind_with(inner, &access, Some(schemas)).as_ref(),
+            scope.schemas,
+            cel::this_binding_for_kind_with(inner, &access, Some(scope.schemas)).as_ref(),
         ));
     }
-    if matches!(kind, FieldKind::Message { full_name } if !full_name.starts_with("google.protobuf."))
+    if let FieldKind::Message { full_name } = kind
+        && let Some(validate) = scope.nested_validate(full_name, value)?
     {
-        checks.push(recurse(value, site));
+        checks.push(recurse(&validate, site));
     }
     if checks.is_empty() {
         return Ok(TokenStream::new());
@@ -170,10 +172,11 @@ pub(super) fn emit_custom(
 }
 
 /// Prefix nested violations, but propagate schema and evaluation failures.
-pub(super) fn recurse(value: &TokenStream, site: &RuleSite) -> TokenStream {
+/// `validate` is the nested message's validation call.
+pub(super) fn recurse(validate: &TokenStream, site: &RuleSite) -> TokenStream {
     let field = site.field_path();
     quote! {
-        if let Err(sub) = (#value).validate() {
+        if let Err(sub) = #validate {
             if sub.compile_error.is_some() || sub.runtime_error.is_some() {
                 return Err(sub);
             }

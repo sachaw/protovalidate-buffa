@@ -120,14 +120,14 @@ fn map_rule_path_ty(inner: &str, inner_num: i32, ty: &str) -> TokenStream {
 /// Panics if `min_items` or `max_items` cannot be converted to `usize`. In
 /// practice proto length bounds are small non-negative integers, so this
 /// invariant always holds.
-pub fn emit_repeated(
+pub(crate) fn emit_repeated(
     accessor: &syn::Ident,
     name_lit: &str,
     field_number: i32,
     element_type_variant: &str,
     spec: &RepeatedStandard,
     element_kind: &FieldKind,
-    schemas: &crate::emit::cel::SchemaIndex,
+    scope: &crate::emit::Scope<'_>,
 ) -> Result<TokenStream> {
     let mut out: Vec<TokenStream> = Vec::new();
     let fp = || repeated_field_path(name_lit, field_number, element_type_variant);
@@ -206,7 +206,7 @@ pub fn emit_repeated(
         spec.items.as_deref(),
         &site,
         super::value::Presence::Implicit,
-        schemas,
+        scope,
     )?;
     if !checks.is_empty() {
         out.push(quote! { for (idx, elem) in self.#accessor.iter().enumerate() { #checks } });
@@ -233,14 +233,14 @@ pub fn emit_repeated(
 /// Panics if `min_pairs` or `max_pairs` cannot be converted to `usize`. In
 /// practice proto size bounds are small non-negative integers, so this
 /// invariant always holds.
-pub fn emit_map(
+pub(crate) fn emit_map(
     map: &TokenStream,
     name_lit: &str,
     field_number: i32,
     spec: &MapStandard,
     key_kind: &FieldKind,
     value_kind: &FieldKind,
-    schemas: &crate::emit::cel::SchemaIndex,
+    scope: &crate::emit::Scope<'_>,
 ) -> Result<TokenStream> {
     let mut out: Vec<TokenStream> = Vec::new();
     let fp = || map_field_path(name_lit, field_number);
@@ -317,7 +317,7 @@ pub fn emit_map(
             rules,
             &site,
             super::value::Presence::Implicit,
-            schemas,
+            scope,
         )?);
     }
     if checks.iter().any(|check| !check.is_empty()) {

@@ -150,9 +150,10 @@ buffa's conversion and collision rules, while CEL expressions and validation
 error paths keep the original protobuf names. Oneof enum and variant names are
 unaffected.
 
-For in-process generation, set `CodeGeneratorRequest.parameter` before calling
-`scan::gather`, for example `Some("idiomatic_field_names=true".into())`. Then pass
-the scanned validators to `emit::render` or `emit::render_with_options` as usual.
+For in-process generation, set `CodeGeneratorRequest.parameter`, for example
+`Some("idiomatic_field_names=true".into())`, and pass the request to
+`emit::render_request`. It resolves every type path against the request's
+descriptors exactly as Buffa does.
 
 ### Include validators beside message types
 
@@ -189,8 +190,6 @@ For package `example.v1`, mount both generated files:
 ```rust
 pub mod example {
     pub mod v1 {
-        use crate::example;
-
         include!("gen/proto/example.v1.rs");
         include!("gen/proto/example.v1.validate.rs");
     }
@@ -205,9 +204,8 @@ no validation annotations still get validators. Packages with only enums or
 services need no validator include. The unnamed package uses
 `__buffa.validate.rs`, beside Buffa's `__buffa.rs`.
 
-Preserve the package hierarchy for cross-package references. Enum validators
-use paths beginning at the top-level protobuf package, so bring those roots
-into scope in each consuming module (for example, `use crate::example;`).
+Preserve the package hierarchy for cross-package references. Validators name
+types with the same relative paths Buffa's own generated code uses.
 
 `proto_module` is ignored with `packaging=false`. Omitting both flags preserves
 the existing output. Either bare flag means `true`; both accept explicit
@@ -216,7 +214,7 @@ When switching an existing
 output directory to this mode, remove old generated packaging files once;
 generation does not delete files left by previous runs.
 
-For in-process generation, pass these options to `emit::render_with_options`:
+For in-process generation, pass these options to `emit::render_request`:
 
 ```rust
 emit::Options {

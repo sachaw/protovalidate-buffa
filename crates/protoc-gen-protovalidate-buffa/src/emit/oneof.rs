@@ -4,15 +4,12 @@ use anyhow::Result;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
-use crate::scan::{FieldKind, FieldValidator, OneofValidator};
+use crate::{
+    emit::{Scope, Shape},
+    scan::{FieldKind, FieldValidator, MessageValidators, OneofValidator},
+};
 
-#[derive(Clone, Copy)]
-enum Representation {
-    Owned,
-    View,
-}
-
-/// Emit the validation snippet for a single oneof.
+/// Emit the validation snippet for a single oneof of `msg`.
 ///
 /// Generates a `match &self.<oneof>` block that:
 ///   1. Checks `oneof.required` when the entire oneof is `None`.
@@ -21,33 +18,11 @@ enum Representation {
 ///
 /// # Errors
 ///
-/// Returns an error if a variant's enum-rule type reference cannot be resolved
-/// to a local Rust path. (Field/oneof names are escaped via
-/// [`crate::emit::field_ident`], which is infallible.)
-pub fn emit(v: &OneofValidator) -> Result<TokenStream> {
-    emit_for(
-        v,
-        Representation::Owned,
-        &crate::emit::cel::SchemaIndex::new(),
-    )
-}
-
-pub(super) fn emit_with_schemas(
+/// Returns an error if a type a variant references cannot be resolved.
+pub(crate) fn emit(
     v: &OneofValidator,
-    shape: super::Shape,
-    schemas: &super::cel::SchemaIndex,
-) -> Result<TokenStream> {
-    let representation = match shape {
-        super::Shape::Owned => Representation::Owned,
-        super::Shape::View => Representation::View,
-    };
-    emit_for(v, representation, schemas)
-}
-
-fn emit_for(
-    v: &OneofValidator,
-    representation: Representation,
-    schemas: &super::cel::SchemaIndex,
+    msg: &MessageValidators,
+    scope: &Scope<'_>,
 ) -> Result<TokenStream> {
     let has_required = v.required;
     let has_required_variants = v.fields.iter().any(|f| f.required);
@@ -55,10 +30,11 @@ fn emit_for(
     let accessor = crate::emit::field_ident(&v.rust_name);
     let name_lit = &v.name;
     let enumeration = to_pascal_case(&v.name);
-    let view = matches!(representation, Representation::View);
+    let view = scope.shape == Shape::View;
+    let root = scope.package_root(&msg.proto_name)?;
     let variant_of = |f: &FieldValidator| {
         variant_path(
-            None,
+            &root,
             &v.parent_msg_name,
             &enumeration,
             &to_pascal_case(&f.field_name),
@@ -97,7 +73,7 @@ fn emit_for(
     let some_arms: Vec<TokenStream> = v
         .fields
         .iter()
-        .map(|f| emit_variant_arm(f, &variant_of(f), schemas))
+        .map(|f| emit_variant_arm(f, &variant_of(f), scope))
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .filter(|ts| !ts.is_empty())
@@ -241,7 +217,7 @@ fn emit_required_variant_blocks(
 fn emit_variant_arm(
     f: &FieldValidator,
     variant: &TokenStream,
-    schemas: &super::cel::SchemaIndex,
+    scope: &Scope<'_>,
 ) -> Result<TokenStream> {
     let value = super::value::element_value(&f.field_type, &format_ident!("v"));
     let ty = if f.is_group {
@@ -256,7 +232,7 @@ fn emit_variant_arm(
         Some(f),
         &site,
         super::value::Presence::Explicit,
-        schemas,
+        scope,
     )?;
     if checks.is_empty() {
         return Ok(TokenStream::new());
@@ -266,18 +242,21 @@ fn emit_variant_arm(
     })
 }
 
-/// A oneof variant's path. `package` roots it at another package.
+/// A oneof variant's path. `root` is the path to the package module
+/// declaring the message, empty for the current module.
 pub(super) fn variant_path(
-    package: Option<&str>,
+    root: &str,
     parent_msg_name: &str,
     enumeration: &str,
     variant: &str,
     view: bool,
 ) -> TokenStream {
-    let package = package
-        .into_iter()
-        .flat_map(|package| package.split('.'))
-        .map(crate::emit::field_ident);
+    let root = if root.is_empty() {
+        TokenStream::new()
+    } else {
+        let root = buffa_codegen::idents::rust_path_to_tokens(root);
+        quote! { #root:: }
+    };
     let oneof = if view {
         quote! { view::oneof }
     } else {
@@ -286,7 +265,7 @@ pub(super) fn variant_path(
     let module = module_path(parent_msg_name);
     let enumeration = crate::emit::field_ident(enumeration);
     let variant = crate::emit::field_ident(variant);
-    quote! { #(#package::)* __buffa::#oneof::#module::#enumeration::#variant }
+    quote! { #root __buffa::#oneof::#module::#enumeration::#variant }
 }
 
 /// The module buffa generates for a message's oneof enums: one snake_case
