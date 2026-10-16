@@ -711,7 +711,7 @@ pub type SchemaIndex = std::collections::BTreeMap<String, MessageSchema>;
 /// Oneof paths are resolved relative to `package`, the package of the file
 /// being generated.
 pub(crate) fn build_schema_index(
-    messages: &[MessageValidators],
+    messages: &[&MessageValidators],
     types: &crate::emit::types::Types<'_>,
     package: &str,
 ) -> anyhow::Result<SchemaIndex> {

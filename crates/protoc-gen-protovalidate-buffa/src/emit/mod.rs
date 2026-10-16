@@ -1,7 +1,7 @@
 //! Orchestrate the emit phase: group scanned validators by source `.proto`
 //! file or package, with optional module packaging.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 use buffa_codegen::generated::{
@@ -201,6 +201,10 @@ pub(crate) struct Scope<'a> {
     package: &'a str,
     /// The file's validator-set marker (`__Validators`).
     marker: &'a syn::Ident,
+    /// Messages with a public `Validate` impl in this generation run.
+    validated: &'a BTreeSet<&'a str>,
+    /// Imported messages this file carries `Embedded` copies of.
+    embedded: &'a BTreeSet<&'a str>,
 }
 
 impl Scope<'_> {
@@ -230,20 +234,33 @@ impl Scope<'_> {
     }
 
     /// The expression validating nested message `value` of type `full_name`,
-    /// or `None` when the type has no generated validator (well-known types).
+    /// or `None` when the type has nothing to validate: well-known types, and
+    /// imported messages without rules.
+    ///
+    /// Messages generated in this run dispatch through `Validate<_>`, which
+    /// has exactly one impl for them here. Imported messages use this file's
+    /// `Embedded` copy, so no other validator crate is involved.
     pub(crate) fn nested_validate(
         &self,
         full_name: &str,
         shape: Shape,
         value: &TokenStream,
     ) -> Result<Option<TokenStream>> {
-        if full_name.starts_with("google.protobuf.") {
-            return Ok(None);
-        }
-        let ty = self.message_type(full_name, shape)?;
-        Ok(Some(quote! {
-            <#ty as ::protovalidate_buffa::Validate<_>>::validate(#value)
-        }))
+        let ty = self.message_type(full_name, shape);
+        Ok(if self.validated.contains(full_name) {
+            let ty = ty?;
+            Some(quote! {
+                <#ty as ::protovalidate_buffa::Validate<_>>::validate(#value)
+            })
+        } else if self.embedded.contains(full_name) {
+            let ty = ty?;
+            let marker = self.marker;
+            Some(quote! {
+                <#ty as ::protovalidate_buffa::__private::Embedded<#marker>>::validate(#value)
+            })
+        } else {
+            None
+        })
     }
 }
 
@@ -364,7 +381,12 @@ pub fn render(messages: &[MessageValidators]) -> Result<Vec<File>> {
 /// See [`render`].
 pub fn render_with_options(messages: &[MessageValidators], opts: &Options) -> Result<Vec<File>> {
     let (files, to_generate) = types::synthesize_descriptors(messages);
-    render_set(&files, &to_generate, messages, opts)
+    // Without descriptors, assume every referenced message has validators.
+    let validated = messages
+        .iter()
+        .flat_map(|m| m.referenced_messages().chain([m.proto_name.as_str()]))
+        .collect();
+    render_set(&files, &to_generate, messages, &[], &validated, opts)
 }
 
 /// Scan `request` and render its validators, resolving every type path
@@ -381,10 +403,14 @@ pub fn render_with_options(messages: &[MessageValidators], opts: &Options) -> Re
 /// [`render`].
 pub fn render_request(request: &CodeGeneratorRequest, opts: &Options) -> Result<Vec<File>> {
     let messages = crate::scan::gather(request)?;
+    let imports = crate::scan::gather_imports(request, &messages)?;
+    let validated = messages.iter().map(|m| m.proto_name.as_str()).collect();
     render_set(
         &request.proto_file,
         &request.file_to_generate,
         &messages,
+        &imports,
+        &validated,
         opts,
     )
 }
@@ -394,6 +420,8 @@ fn render_set(
     descriptors: &[FileDescriptorProto],
     to_generate: &[String],
     messages: &[MessageValidators],
+    imports: &[MessageValidators],
+    validated: &BTreeSet<&str>,
     opts: &Options,
 ) -> Result<Vec<File>> {
     let mut config = buffa_codegen::CodeGenConfig::default();
@@ -407,6 +435,9 @@ fn render_set(
     let require_absolute = !config.extern_paths.is_empty();
     let types = types::Types::new(descriptors, to_generate, &config, require_absolute);
 
+    let imported: BTreeMap<&str, &MessageValidators> =
+        imports.iter().map(|m| (m.proto_name.as_str(), m)).collect();
+    let all: Vec<&MessageValidators> = messages.iter().chain(imports).collect();
     let mut groups: BTreeMap<&str, Vec<&MessageValidators>> = BTreeMap::new();
     for m in messages {
         let key = if opts.file_per_package {
@@ -424,15 +455,20 @@ fn render_set(
     let mut by_package: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (key, msgs) in groups {
         let package = msgs.first().map_or("", |m| m.package.as_str());
-        let schemas = cel::build_schema_index(messages, &types, package)?;
+        let schemas = cel::build_schema_index(&all, &types, package)?;
         let marker = marker_ident((!opts.file_per_package).then_some(key));
+        let embedded = embedded_closure(&msgs, &imported);
         let scope = Scope {
             schemas: &schemas,
             types: &types,
             package,
             marker: &marker,
+            validated,
+            embedded: &embedded,
         };
-        let body = render_file(&msgs, &scope)?;
+        let embedded: Vec<&MessageValidators> =
+            embedded.iter().map(|name| imported[name]).collect();
+        let body = render_file(&msgs, &embedded, &scope)?;
         let stem = if opts.file_per_package {
             let filename = buffa_codegen::package_to_filename(key);
             filename
@@ -610,12 +646,19 @@ fn render_package_node(node: &PackageNode) -> TokenStream {
     }
 }
 
-fn render_file(msgs: &[&MessageValidators], scope: &Scope<'_>) -> Result<TokenStream> {
+fn render_file(
+    msgs: &[&MessageValidators],
+    embedded: &[&MessageValidators],
+    scope: &Scope<'_>,
+) -> Result<TokenStream> {
+    let marker = scope.marker;
+    let validate = quote! { ::protovalidate_buffa::Validate<#marker> };
+    let embed = quote! { ::protovalidate_buffa::__private::Embedded<#marker> };
     let impls: Vec<TokenStream> = msgs
         .iter()
-        .map(|m| render_message(m, scope))
+        .map(|m| render_message(m, &validate, scope))
+        .chain(embedded.iter().map(|m| render_message(m, &embed, scope)))
         .collect::<Result<_>>()?;
-    let marker = scope.marker;
     Ok(quote! {
         /// The validator set this file implements
         /// [`Validate`](::protovalidate_buffa::Validate) for. Inferred at call
@@ -625,6 +668,25 @@ fn render_file(msgs: &[&MessageValidators], scope: &Scope<'_>) -> Result<TokenSt
         pub enum #marker {}
         #( #impls )*
     })
+}
+
+/// The imported messages reachable from `msgs` through message fields that
+/// carry rules (`imported` holds only those), walking through imported
+/// messages but not into other generated ones, which validate themselves.
+fn embedded_closure<'a>(
+    msgs: &[&'a MessageValidators],
+    imported: &BTreeMap<&'a str, &'a MessageValidators>,
+) -> BTreeSet<&'a str> {
+    let mut closure = BTreeSet::new();
+    let mut queue: Vec<&str> = msgs.iter().flat_map(|m| m.referenced_messages()).collect();
+    while let Some(name) = queue.pop() {
+        if let Some((&name, message)) = imported.get_key_value(name)
+            && closure.insert(name)
+        {
+            queue.extend(message.referenced_messages());
+        }
+    }
+    closure
 }
 
 /// The marker type for a file's validator set: `__Validators` for a
@@ -666,7 +728,13 @@ pub(crate) fn gen_allows() -> TokenStream {
     }
 }
 
-fn render_message(msg: &MessageValidators, scope: &Scope<'_>) -> Result<TokenStream> {
+/// Render the owned and view impls of `validate_trait` (`Validate<marker>`
+/// or `Embedded<marker>`) for `msg`.
+fn render_message(
+    msg: &MessageValidators,
+    validate_trait: &TokenStream,
+    scope: &Scope<'_>,
+) -> Result<TokenStream> {
     use std::collections::HashSet;
     let rust_path = scope.message_type(&msg.proto_name, Shape::Owned)?;
     let view_path = scope.message_type(&msg.proto_name, Shape::View)?;
@@ -741,12 +809,11 @@ fn render_message(msg: &MessageValidators, scope: &Scope<'_>) -> Result<TokenStr
     let view_map_bindings = canonical_map_bindings(msg, Shape::View);
 
     let allows = gen_allows();
-    let marker = scope.marker;
     if let Some(reason) = &msg.compile_error {
         let impls = [&rust_path, &view_path].map(|rust_path| {
             quote! {
                 #allows
-                impl ::protovalidate_buffa::Validate<#marker> for #rust_path {
+                impl #validate_trait for #rust_path {
                     fn validate(
                         &self,
                     ) -> ::core::result::Result<(), ::protovalidate_buffa::ValidationError> {
@@ -777,7 +844,7 @@ fn render_message(msg: &MessageValidators, scope: &Scope<'_>) -> Result<TokenStr
                        cel_calls: &[TokenStream]| {
         quote! {
             #allows
-            impl ::protovalidate_buffa::Validate<#marker> for #rust_path {
+            impl #validate_trait for #rust_path {
                 fn validate(
                     &self,
                 ) -> ::core::result::Result<(), ::protovalidate_buffa::ValidationError> {

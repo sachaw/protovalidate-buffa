@@ -1058,6 +1058,202 @@ pub fn gather(request: &CodeGeneratorRequest) -> anyhow::Result<Vec<MessageValid
     Ok(out)
 }
 
+/// Scan the messages from outside `file_to_generate` that `messages` embed
+/// and that carry rules, directly or through their own fields.
+///
+/// Generated files copy these messages' validators in (see
+/// `protovalidate_buffa::__private::Embedded`), so nested validation does
+/// not depend on another validator crate. Messages without rules are left
+/// out, as are well-known types, which have no generated validators.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`gather`].
+pub fn gather_imports(
+    request: &CodeGeneratorRequest,
+    messages: &[MessageValidators],
+) -> anyhow::Result<Vec<MessageValidators>> {
+    let generate_set: std::collections::HashSet<&str> = request
+        .file_to_generate
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
+    let mut index = std::collections::HashMap::new();
+    for file in &request.proto_file {
+        if generate_set.contains(file.name.as_deref().unwrap_or("")) {
+            continue;
+        }
+        let package = file.package.as_deref().unwrap_or("");
+        for msg in &file.message_type {
+            index_message(file, package, "", msg, &mut index);
+        }
+    }
+
+    let predefined_exts = collect_predefined_extensions(request);
+    let mut imports: std::collections::BTreeMap<String, MessageValidators> =
+        std::collections::BTreeMap::new();
+    let mut queue: Vec<String> = messages
+        .iter()
+        .flat_map(MessageValidators::referenced_messages)
+        .map(str::to_string)
+        .collect();
+    while let Some(name) = queue.pop() {
+        if imports.contains_key(&name) {
+            continue;
+        }
+        let Some(&(file, package, ref local_name, msg)) = index.get(&name) else {
+            continue;
+        };
+        let message = scan_message(
+            file,
+            file.name.as_deref().unwrap_or(""),
+            package,
+            local_name,
+            msg,
+            &predefined_exts,
+        )?;
+        queue.extend(message.referenced_messages().map(str::to_string));
+        imports.insert(name, message);
+    }
+    if idiomatic_field_names(request.parameter.as_deref().unwrap_or(""))? {
+        let names = field_names::FieldNames::new(&request.proto_file);
+        for message in imports.values_mut() {
+            names.apply(message);
+        }
+    }
+
+    // A message carries rules if it has its own or embeds one that does.
+    let all: Vec<&MessageValidators> = messages.iter().chain(imports.values()).collect();
+    let mut with_rules: std::collections::HashSet<&str> = all
+        .iter()
+        .filter(|m| m.has_own_rules())
+        .map(|m| m.proto_name.as_str())
+        .collect();
+    loop {
+        let before = with_rules.len();
+        for message in &all {
+            if message
+                .referenced_messages()
+                .any(|name| with_rules.contains(name))
+            {
+                with_rules.insert(&message.proto_name);
+            }
+        }
+        if with_rules.len() == before {
+            break;
+        }
+    }
+    let with_rules: std::collections::HashSet<String> =
+        with_rules.into_iter().map(str::to_string).collect();
+    Ok(imports
+        .into_values()
+        .filter(|m| with_rules.contains(&m.proto_name))
+        .collect())
+}
+
+type MessageIndex<'a> = std::collections::HashMap<
+    String,
+    (
+        &'a FileDescriptorProto,
+        &'a str,
+        String,
+        &'a DescriptorProto,
+    ),
+>;
+
+fn index_message<'a>(
+    file: &'a FileDescriptorProto,
+    package: &'a str,
+    parent: &str,
+    msg: &'a DescriptorProto,
+    index: &mut MessageIndex<'a>,
+) {
+    if is_map_entry(msg) {
+        return;
+    }
+    let local_name = local_name(parent, msg);
+    for nested in &msg.nested_type {
+        index_message(file, package, &local_name, nested, index);
+    }
+    let full_name = if package.is_empty() {
+        local_name.clone()
+    } else {
+        format!("{package}.{local_name}")
+    };
+    index.insert(full_name, (file, package, local_name, msg));
+}
+
+impl MessageValidators {
+    /// Whether the message itself has any rule: field, oneof, message-level,
+    /// or a schema mismatch reported at validation time. Rules of embedded
+    /// messages are not counted.
+    #[must_use]
+    pub fn has_own_rules(&self) -> bool {
+        self.compile_error.is_some()
+            || !self.message_cel.is_empty()
+            || !self.message_oneofs.is_empty()
+            || self.oneof_rules.iter().any(|o| o.required)
+            || self.field_rules.iter().any(FieldValidator::has_own_rules)
+    }
+
+    /// Fully-qualified names of the non-well-known message types this
+    /// message validates recursively: singular, oneof, repeated and map-value
+    /// message fields that are not ignored.
+    pub fn referenced_messages(&self) -> impl Iterator<Item = &str> {
+        self.field_rules
+            .iter()
+            .filter(|f| !matches!(f.ignore, Ignore::Always))
+            .filter_map(|f| {
+                let kind = match &f.field_type {
+                    FieldKind::Repeated(inner) => inner.as_ref(),
+                    FieldKind::Map { value, .. } => value.as_ref(),
+                    kind => kind,
+                };
+                match kind {
+                    FieldKind::Message { full_name }
+                        if !full_name.starts_with("google.protobuf.") =>
+                    {
+                        Some(full_name.as_str())
+                    }
+                    _ => None,
+                }
+            })
+    }
+}
+
+impl FieldValidator {
+    /// Whether any rule applies to the field's own value.
+    const fn has_own_rules(&self) -> bool {
+        !matches!(self.ignore, Ignore::Always)
+            && ((self.required && !self.is_legacy_required)
+                || !self.cel.is_empty()
+                || !self.standard.is_empty())
+    }
+}
+
+impl StandardRules {
+    /// Whether no standard or predefined rule is set.
+    const fn is_empty(&self) -> bool {
+        self.string.is_none()
+            && self.bytes.is_none()
+            && self.int32.is_none()
+            && self.int64.is_none()
+            && self.uint32.is_none()
+            && self.uint64.is_none()
+            && self.float.is_none()
+            && self.double.is_none()
+            && self.enum_rules.is_none()
+            && self.repeated.is_none()
+            && self.map.is_none()
+            && self.bool_rules.is_none()
+            && self.any_rules.is_none()
+            && self.duration.is_none()
+            && self.timestamp.is_none()
+            && self.field_mask.is_none()
+            && self.predefined.is_empty()
+    }
+}
+
 fn idiomatic_field_names(parameter: &str) -> anyhow::Result<bool> {
     let mut enabled = false;
     for part in parameter.split(',') {
@@ -1087,26 +1283,56 @@ fn gather_message(
     out: &mut Vec<MessageValidators>,
     predef: &PredefinedExtRegistry,
 ) -> anyhow::Result<()> {
-    let msg_name = msg.name.as_deref().unwrap_or("");
-
     // Skip synthetic map-entry messages — they have no user-visible validators.
-    if msg
-        .options
+    if is_map_entry(msg) {
+        return Ok(());
+    }
+    let local_name = local_name(parent, msg);
+    out.push(scan_message(
+        file,
+        source_file,
+        package,
+        &local_name,
+        msg,
+        predef,
+    )?);
+
+    // Recurse into nested messages.
+    for nested in &msg.nested_type {
+        gather_message(file, source_file, package, &local_name, nested, out, predef)?;
+    }
+
+    Ok(())
+}
+
+fn is_map_entry(msg: &DescriptorProto) -> bool {
+    msg.options
         .as_option()
         .and_then(|o| o.map_entry)
         .unwrap_or(false)
-    {
-        return Ok(());
-    }
+}
 
-    // Name relative to the package, e.g. `Outer.Inner`.
-    let local_name = if parent.is_empty() {
+/// Name relative to the package, e.g. `Outer.Inner`.
+fn local_name(parent: &str, msg: &DescriptorProto) -> String {
+    let msg_name = msg.name.as_deref().unwrap_or("");
+    if parent.is_empty() {
         msg_name.to_string()
     } else {
         format!("{parent}.{msg_name}")
-    };
+    }
+}
+
+/// Scan one message's own rules (not its nested messages).
+fn scan_message(
+    file: &FileDescriptorProto,
+    source_file: &str,
+    package: &str,
+    local_name: &str,
+    msg: &DescriptorProto,
+    predef: &PredefinedExtRegistry,
+) -> anyhow::Result<MessageValidators> {
     let qualified_name = if package.is_empty() {
-        local_name.clone()
+        local_name.to_string()
     } else {
         format!("{package}.{local_name}")
     };
@@ -1160,7 +1386,7 @@ fn gather_message(
             .filter(|f| f.oneof_index == Some(i32::try_from(idx).expect("oneof index fits in i32")))
             .map(|f| gather_field(file, msg, f, &qualified_name, predef))
             .collect::<anyhow::Result<_>>()?;
-        let ov = gather_oneof(&local_name, oneof, variant_fields);
+        let ov = gather_oneof(local_name, oneof, variant_fields);
         oneof_rules_out.push(ov);
     }
 
@@ -1173,7 +1399,7 @@ fn gather_message(
         .or_else(|| check_message_cel_missing_fields(&message_cel, &field_rules_out))
         .or_else(|| check_message_cel_type_errors(&message_cel, &field_rules_out));
 
-    out.push(MessageValidators {
+    Ok(MessageValidators {
         proto_name: qualified_name,
         package: package.to_string(),
         source_file: source_file.to_string(),
@@ -1182,14 +1408,7 @@ fn gather_message(
         field_rules: field_rules_out,
         oneof_rules: oneof_rules_out,
         compile_error,
-    });
-
-    // Recurse into nested messages.
-    for nested in &msg.nested_type {
-        gather_message(file, source_file, package, &local_name, nested, out, predef)?;
-    }
-
-    Ok(())
+    })
 }
 
 /// Check whether the field's rule family matches its declared type.
