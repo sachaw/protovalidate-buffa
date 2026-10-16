@@ -21,7 +21,10 @@ struct FakeView {
     valid: bool,
 }
 
-impl Validate for FakeView {
+/// This test's validator set.
+enum Fakes {}
+
+impl Validate<Fakes> for FakeView {
     fn validate(&self) -> Result<(), ValidationError> {
         if self.valid {
             Ok(())

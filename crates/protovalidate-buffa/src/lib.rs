@@ -30,6 +30,21 @@
 //! The full upstream `protovalidate-conformance` suite (2872 cases,
 //! covering proto2, proto3, and editions 2023) passes against code
 //! emitted by the paired plugin.
+//!
+//! # Validators in their own crate
+//!
+//! Generated validators can live in the same crate as the Buffa message
+//! types or in a separate crate that depends on a types crate (for example a
+//! Buffa SDK from the Buffer Schema Registry). A crate that uses validators
+//! from another crate must load it once, at its crate root:
+//!
+//! ```ignore
+//! use acme_protovalidate as _;
+//! ```
+//!
+//! Rust ignores a dependency that is never referenced, so without this line
+//! no validator impls exist and calls to `validate()` fail to compile with a
+//! note pointing here. See [`Validate`].
 
 #[doc(hidden)]
 pub mod __private;
@@ -79,7 +94,54 @@ pub use protovalidate_buffa_macros::connect_impl;
 pub use protovalidate_buffa_protos::buf::validate as proto;
 pub use regex;
 
-pub trait Validate {
+/// Validation for a generated message or view.
+///
+/// `protoc-gen-protovalidate-buffa` implements this trait for every message
+/// and view type in the files it generates. `Set` is a hidden marker type
+/// (`__Validators`) that each generated file declares. Because the marker is
+/// local to the generated code, the impls are legal even when the message
+/// types come from another crate, so validators can live in their own crate
+/// beside a Buffa types crate.
+///
+/// Call sites never name `Set`; Rust infers it:
+///
+/// ```ignore
+/// use protovalidate_buffa::Validate as _;
+///
+/// request.validate()?;
+/// ```
+///
+/// # Loading validators from another crate
+///
+/// Rust only links a dependency's impls when the crate is referenced. A
+/// validator crate that only appears in `Cargo.toml` contributes nothing, so
+/// reference it once at the crate root:
+///
+/// ```ignore
+/// use acme_protovalidate as _;
+/// ```
+///
+/// Validators generated into the same crate as the code that calls them
+/// need no such line.
+///
+/// # Generic code
+///
+/// Carry the set as a type parameter, `fn check<M: Validate<S>, S>(m: &M)`, or
+/// erase it with [`validator`].
+///
+/// # Several validator sets for one type
+///
+/// If two validator sets for the same type are loaded (for example a
+/// registry SDK and a local regeneration), inference reports the ambiguity
+/// (`E0283`). Pick one explicitly:
+/// `Validate::<acme_protovalidate::acme::v1::__Validators>::validate(&m)`, or
+/// `#[connect_impl(set = acme_protovalidate::acme::v1::__Validators)]`.
+#[diagnostic::on_unimplemented(
+    message = "no protovalidate validators for `{Self}` are loaded",
+    label = "no validators for this type are loaded",
+    note = "load the crate protoc-gen-protovalidate-buffa generated for this type's module with `use <crate> as _;` at your crate root"
+)]
+pub trait Validate<Set> {
     /// Runs every rule attached to this message (and any nested messages),
     /// collecting violations rather than short-circuiting on the first.
     ///
@@ -91,6 +153,55 @@ pub trait Validate {
     /// (the `connect` feature) maps violations to `invalid_argument` and
     /// validator defects to `internal`.
     fn validate(&self) -> Result<(), ValidationError>;
+}
+
+/// The validator for `M` as a plain function pointer, with the validator set
+/// erased.
+///
+/// Generic code that stores validation for later, such as a store keyed by
+/// message type, cannot add a `Set` parameter to an impl that does not use
+/// it. Capture the function where `M` is concrete instead and store it:
+///
+/// ```
+/// use protovalidate_buffa::{Validate, ValidationError, validator};
+///
+/// struct Store<M> {
+///     check: fn(&M) -> Result<(), ValidationError>,
+///     items: Vec<M>,
+/// }
+///
+/// impl<M> Store<M> {
+///     fn new<S>() -> Self
+///     where
+///         M: Validate<S>,
+///     {
+///         Self { check: validator::<M, S>(), items: Vec::new() }
+///     }
+///
+///     fn insert(&mut self, item: M) -> Result<(), ValidationError> {
+///         (self.check)(&item)?;
+///         self.items.push(item);
+///         Ok(())
+///     }
+/// }
+///
+/// # enum Local {}
+/// # struct Name(String);
+/// # impl Validate<Local> for Name {
+/// #     fn validate(&self) -> Result<(), ValidationError> {
+/// #         if self.0.is_empty() { Err(ValidationError::default()) } else { Ok(()) }
+/// #     }
+/// # }
+/// let mut names = Store::<Name>::new();
+/// assert!(names.insert(Name("ada".into())).is_ok());
+/// assert!(names.insert(Name(String::new())).is_err());
+/// ```
+#[must_use]
+pub const fn validator<M, Set>() -> fn(&M) -> Result<(), ValidationError>
+where
+    M: Validate<Set> + ?Sized,
+{
+    <M as Validate<Set>>::validate
 }
 
 #[macro_export]

@@ -47,10 +47,10 @@ fn assert_rules(result: Result<(), ValidationError>, expected: &[&str]) {
     assert_eq!(actual, expected);
 }
 
-fn assert_owned_and_view<M>(owned: &M, expected: &[&str]) -> Result<(), buffa::DecodeError>
+fn assert_owned_and_view<M, S>(owned: &M, expected: &[&str]) -> Result<(), buffa::DecodeError>
 where
-    M: HasMessageView + Validate,
-    for<'a> M::View<'a>: Validate,
+    M: HasMessageView + Validate<S>,
+    for<'a> M::View<'a>: Validate<S>,
 {
     assert_rules(owned.validate(), expected);
     let bytes = owned.encode_to_vec();

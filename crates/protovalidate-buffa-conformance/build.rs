@@ -500,7 +500,7 @@ fn write_dispatch_rs(
         let rust_path = format!("crate::generated::{}", rust_segs.join("::"));
         writeln!(
             out,
-            "        \"{fqn}\" => Some(run::<{rust}>(bytes)),",
+            "        \"{fqn}\" => Some(run::<{rust}, _>(bytes)),",
             fqn = v.proto_name,
             rust = rust_path
         )
@@ -510,7 +510,7 @@ fn write_dispatch_rs(
     out.push_str("    }\n");
     out.push_str("}\n\n");
 
-    out.push_str("fn run<M: Message + Validate + Default>(bytes: &[u8]) -> CaseOutcome {\n");
+    out.push_str("fn run<M: Message + Validate<S> + Default, S>(bytes: &[u8]) -> CaseOutcome {\n");
     out.push_str("    let msg = match M::decode_from_slice(bytes) {\n");
     out.push_str("        Ok(m) => m,\n");
     out.push_str("        Err(e) => return CaseOutcome::RuntimeError(format!(\"decode: {e}\")),\n");
