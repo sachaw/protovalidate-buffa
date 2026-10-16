@@ -147,6 +147,7 @@ fn flat_output_ignores_proto_module_even_when_it_is_invalid() {
     assert_eq!(response.file, expected);
     let options = emit::Options {
         proto_module: "not a Rust path".into(),
+        extern_paths: Vec::new(),
         packaging: false,
         file_per_package: true,
     };

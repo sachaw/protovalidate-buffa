@@ -39,39 +39,6 @@ fn main() -> anyhow::Result<()> {
 fn run(
     request: &CodeGeneratorRequest,
 ) -> anyhow::Result<Vec<buffa_codegen::generated::compiler::code_generator_response::File>> {
-    let opts = parse_opts(request.parameter.as_deref().unwrap_or(""))?;
+    let opts = emit::Options::parse(request.parameter.as_deref().unwrap_or(""))?;
     emit::render_request(request, &opts)
-}
-
-/// Parse the `opt: [...]` parameters passed via `buf.gen.yaml`. Accepts a
-/// comma-separated `key=value,flag,...` list (the format protoc / buf use
-/// to invoke plugins). Unknown keys are ignored so callers can pass
-/// forward-compatible options.
-fn parse_opts(parameter: &str) -> anyhow::Result<emit::Options> {
-    let mut opts = emit::Options::default();
-    for part in parameter.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let (key, value) = part.split_once('=').unwrap_or((part, "true"));
-        match key.trim() {
-            "proto_module" if part.contains('=') => {
-                opts.proto_module = value.trim().to_string();
-            }
-            key @ ("packaging" | "file_per_package") => {
-                let enabled = match value.trim() {
-                    "true" => true,
-                    "false" => false,
-                    value => anyhow::bail!("{key} must be true or false, got {value:?}"),
-                };
-                match key {
-                    "packaging" => opts.packaging = enabled,
-                    _ => opts.file_per_package = enabled,
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(opts)
 }
