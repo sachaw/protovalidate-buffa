@@ -1,0 +1,8 @@
+error[E0277]: no protovalidate validators for `app_types::app::v1::Tag` are loaded
+ --> tests/ui/unloaded.rs:7:14
+  |
+7 |     let _ = <_ as protovalidate_buffa::Validate<_>>::validate(&Tag::default());
+  |              ^ no validators for this type are loaded
+  |
+  = help: the trait `Validate<_>` is not implemented for `app_types::app::v1::Tag`
+  = note: load the crate protoc-gen-protovalidate-buffa generated for this type's module with `use <crate> as _;` at your crate root

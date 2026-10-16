@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package app.v1;
+
+import "buf/validate/validate.proto";
+import "geo/v1/geo.proto";
+
+enum Kind {
+  KIND_UNSPECIFIED = 0;
+  KIND_OFFICE = 1;
+  KIND_WAREHOUSE = 2;
+}
+
+message Tag {
+  string value = 1 [(buf.validate.field).string.max_len = 8];
+}
+
+message CreateSiteRequest {
+  string name = 1 [(buf.validate.field).string.min_len = 1];
+  geo.v1.GeoPoint location = 2 [(buf.validate.field).required = true];
+  repeated Tag tags = 3;
+  // Explicit presence: generated as `Option<EnumValue<Kind>>`.
+  optional Kind kind = 4 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  geo.v1.Label label = 5;
+  oneof target {
+    geo.v1.GeoPoint point = 6;
+    string address = 7;
+  }
+  map<string, geo.v1.GeoPoint> waypoints = 8;
+}

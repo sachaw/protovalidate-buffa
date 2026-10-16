@@ -1,0 +1,17 @@
+error[E0283]: type annotations needed
+  --> tests/ui/ambiguous.rs:17:19
+   |
+17 |     let _ = point.validate();
+   |                   ^^^^^^^^
+   |
+note: multiple `impl`s satisfying `GeoPoint: Validate<_>` found
+  --> tests/ui/ambiguous.rs:9:1
+   |
+ 9 | impl Validate<Local> for GeoPoint {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: and another `impl` found in the `geo_validate` crate: `impl Validate<geo_validate::geo::v1::__Validators> for GeoPoint;`
+help: try using a fully qualified path to specify the expected types
+   |
+17 -     let _ = point.validate();
+17 +     let _ = <GeoPoint as Validate<Set>>::validate(&point);
+   |
