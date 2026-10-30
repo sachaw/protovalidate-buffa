@@ -108,6 +108,8 @@ pub enum Check {
         path: Box<[Elem]>,
     },
     AnyIn {
+        /// How to read an `Any`'s `type_url`.
+        url: Read,
         urls: Box<[Box<str>]>,
         path: Box<[Elem]>,
         not: bool,
@@ -122,6 +124,15 @@ pub struct Rule {
 }
 
 impl ValuePlan {
+    /// Whether the value is a message checked by its own type's rules alone.
+    pub const fn only_message(&self) -> bool {
+        self.message.is_some()
+            && !self.ignore_zero
+            && self.checks.is_empty()
+            && self.items.is_none()
+            && self.entries.is_none()
+    }
+
     const fn is_empty(&self) -> bool {
         self.checks.is_empty()
             && self.message.is_none()
@@ -731,11 +742,20 @@ impl<'p> Builder<'p> {
                         .collect(),
                     _ => Vec::new(),
                 };
-                if !urls.is_empty() {
+                let url = match singular {
+                    Some(SingularKind::Message(m)) => {
+                        let md = pool.message(m);
+                        md.field_by_name("type_url")
+                            .map(|fd| Read::of(md, fd, pool))
+                    }
+                    _ => None,
+                };
+                if let (false, Some(url)) = (urls.is_empty(), url) {
                     let mut path = prefix.to_vec();
                     path.push(type_elem.clone());
                     path.push(rule_elem.clone());
                     plan.checks.push(Check::AnyIn {
+                        url,
                         urls: urls.into(),
                         path: path.into(),
                         not: rule_fd.name() == "not_in",

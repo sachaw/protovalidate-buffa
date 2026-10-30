@@ -161,7 +161,7 @@ impl Validator {
     ) -> Result<(), ValidationError> {
         let md = pool.message(message);
         self.with_cache(md, pool, |plans, scratch| run(plans, bytes, scratch.spare))
-        .unwrap_or_else(|Malformed| Err(malformed(md)))
+            .unwrap_or_else(|Malformed| Err(malformed(md)))
     }
 
     /// [`validate_encoded`](Self::validate_encoded), telling bytes that do
@@ -184,7 +184,12 @@ impl Validator {
     }
 
     #[cfg(test)]
-    pub(crate) fn probe_run(&self, md: &MessageDescriptor, pool: &Arc<DescriptorPool>, b: &[u8]) -> bool {
+    pub(crate) fn probe_run(
+        &self,
+        md: &MessageDescriptor,
+        pool: &Arc<DescriptorPool>,
+        b: &[u8],
+    ) -> bool {
         self.with_cache(md, pool, |p, s| run(p, b, s.spare).is_ok())
     }
 

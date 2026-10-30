@@ -10,7 +10,7 @@ use regex::Regex;
 use super::{
     Error,
     compile::{Func, Node, Op},
-    eval, functions,
+    eval, functions, typed,
     value::{Const, Read, Value, equals},
 };
 
@@ -38,12 +38,14 @@ pub enum Pred {
 }
 
 /// `this`, or a path of fields from it.
-pub struct Operand(Box<[Read]>);
+pub struct Operand(pub Box<[Read]>);
 
 /// A rule as a native check: it fails when `pred` is `fails_when`, with the
 /// given message, if any.
 pub struct Check {
     pub pred: Pred,
+    /// The predicate compiled for the types it reads, when they are known.
+    pub typed: Option<typed::Test>,
     pub fails_when: bool,
     pub message: Option<Box<str>>,
 }
@@ -54,11 +56,13 @@ impl Check {
             Node::Choose(x) => match (&x.1, &x.2) {
                 (Const::String(m), Const::String(e)) if e.is_empty() => Some(Self {
                     pred: Pred::from_node(&x.0)?,
+                    typed: None,
                     fails_when: true,
                     message: Some(m.clone()),
                 }),
                 (Const::String(e), Const::String(m)) if e.is_empty() => Some(Self {
                     pred: Pred::from_node(&x.0)?,
+                    typed: None,
                     fails_when: false,
                     message: Some(m.clone()),
                 }),
@@ -66,6 +70,7 @@ impl Check {
             },
             n => Some(Self {
                 pred: Pred::from_node(n)?,
+                typed: None,
                 fails_when: false,
                 message: None,
             }),

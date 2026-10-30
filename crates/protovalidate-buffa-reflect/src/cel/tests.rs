@@ -312,7 +312,11 @@ fn wrong_expressions_do_not_compile() {
 fn timing_probe() {
     let pool = pool();
     let idx = pool.message_index("t.Test").expect("declared");
-    let bindings = Bindings { pool: &pool, this: Ty::Int, consts: &[] };
+    let bindings = Bindings {
+        pool: &pool,
+        this: Ty::Int,
+        consts: &[],
+    };
     let p = Program::compile("this > 0", &bindings).unwrap().unwrap();
     let clock = Clock::default();
     let v = Value::Int(5);
@@ -326,18 +330,31 @@ fn timing_probe() {
     let bytes = [8u8, 5];
     let t = std::time::Instant::now();
     for _ in 0..n {
-        std::hint::black_box(validator.validate_encoded(&pool, idx, std::hint::black_box(&bytes)).is_ok());
+        std::hint::black_box(
+            validator
+                .validate_encoded(&pool, idx, std::hint::black_box(&bytes))
+                .is_ok(),
+        );
     }
-    eprintln!("validate (no rules): {:.2} ns", t.elapsed().as_secs_f64() * 1e9 / n as f64);
+    eprintln!(
+        "validate (no rules): {:.2} ns",
+        t.elapsed().as_secs_f64() * 1e9 / n as f64
+    );
     let md = pool.message(idx);
     let t = std::time::Instant::now();
     for _ in 0..n {
         std::hint::black_box(validator.probe_cache(md, &pool));
     }
-    eprintln!("with_cache: {:.2} ns", t.elapsed().as_secs_f64() * 1e9 / n as f64);
+    eprintln!(
+        "with_cache: {:.2} ns",
+        t.elapsed().as_secs_f64() * 1e9 / n as f64
+    );
     let t = std::time::Instant::now();
     for _ in 0..n {
         std::hint::black_box(validator.probe_run(md, &pool, std::hint::black_box(&bytes)));
     }
-    eprintln!("with_cache+run: {:.2} ns", t.elapsed().as_secs_f64() * 1e9 / n as f64);
+    eprintln!(
+        "with_cache+run: {:.2} ns",
+        t.elapsed().as_secs_f64() * 1e9 / n as f64
+    );
 }

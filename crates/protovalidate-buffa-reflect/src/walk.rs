@@ -2,15 +2,16 @@
 
 use std::borrow::Cow;
 
+use buffa_descriptor::ScalarType;
 use protovalidate_buffa::{FieldPath, FieldPathElement, FieldType, Subscript, Violation};
 
 use crate::{
     cel::{
         Clock, Outcome,
-        value::{self, Gathered, List, Map, Msg, Value},
+        value::{self, Gathered, List, Map, Msg, Prim, Value},
     },
     plan::{Check, Elem, MessagePlan, Plans, ValuePlan},
-    wire::{self, Card, Found, Malformed, Raw},
+    wire::{self, Card, Found, Kind, Malformed, Raw},
 };
 
 /// Why a validation stopped before it finished.
@@ -205,6 +206,18 @@ impl<'a> Walker<'a> {
                 continue;
             }
             let read = &plan.slots[field.slot].read;
+            // A message field whose only rules are its type's own needs no
+            // value, only its message.
+            if let (Some(child), Kind::Message(index), None, true) = (
+                field.value.message,
+                read.shape.kind,
+                read.wkt,
+                read.shape.card == Card::Singular && field.value.only_message(),
+            ) {
+                let src = found[field.slot].message(&msg.src, read.shape.number);
+                self.message(child, &Msg::new(src, index, pool), Some(&here))?;
+                continue;
+            }
             let value = match read.shape.card {
                 Card::Singular => value::singular(&found[field.slot], &msg.src, read, pool),
                 _ => Msg::new(msg.src.within(found[field.slot].span), msg.index, pool).read(read),
@@ -257,15 +270,16 @@ impl<'a> Walker<'a> {
                     }
                 }
                 Check::AnyIn {
+                    url,
                     urls,
                     path: rule,
                     not,
                 } => {
                     let Value::Message(m) = v else { continue };
-                    let Some(Value::String(url)) = m.field_by_name("type_url") else {
+                    let Prim::Str(url) = m.prim(url, ScalarType::String) else {
                         continue;
                     };
-                    let listed = urls.iter().any(|u| **u == *url);
+                    let listed = urls.iter().any(|u| u.as_bytes() == url);
                     if listed == *not {
                         let (id, message) = if *not {
                             ("any.not_in", "type URL must not be in the block list")

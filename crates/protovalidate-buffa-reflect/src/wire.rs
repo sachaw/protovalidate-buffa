@@ -446,7 +446,7 @@ impl At {
 /// A field's occurrences that count: the last one, how many there are since
 /// a sibling last cleared the field, and where they sit in their message's
 /// [`Src::base`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Found {
     pub last: Option<At>,
     pub count: u32,

@@ -21,6 +21,7 @@ mod functions;
 mod pred;
 #[cfg(test)]
 mod tests;
+mod typed;
 mod types;
 pub mod value;
 
@@ -115,7 +116,12 @@ impl Program {
             .map_err(|e| CompileError(format!("failed to parse `{source}`: {e}")))?;
         match compile::compile(&ast, bindings) {
             Ok(node) => Ok(node.map(|(n, locals)| {
-                Self(pred::Check::from_node(&n).map_or(Kind::Native(n, locals), Kind::Check))
+                Self(
+                    pred::Check::from_node(&n).map_or(Kind::Native(n, locals), |mut check| {
+                        check.typed = typed::compile(&check.pred, &bindings.this);
+                        Kind::Check(check)
+                    }),
+                )
             })),
             Err(compile::Refusal::Error(e)) => Err(CompileError(format!("`{source}`: {e}"))),
             Err(compile::Refusal::Unsupported) => {
@@ -124,10 +130,15 @@ impl Program {
         }
     }
 
+    #[inline]
     pub fn eval<'a>(&'a self, this: &Value<'a>, clock: &Clock) -> Result<Outcome<'a>, Error> {
         let result = match &self.0 {
             Kind::Check(check) => {
-                return Ok(if check.pred.eval(this)? == check.fails_when {
+                let held = match check.typed.as_ref().and_then(|test| test(this)) {
+                    Some(held) => held,
+                    None => check.pred.eval(this)?,
+                };
+                return Ok(if held == check.fails_when {
                     Outcome::Fail(check.message.as_deref().map(Str::Ref))
                 } else {
                     Outcome::Pass

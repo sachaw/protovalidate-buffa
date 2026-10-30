@@ -214,6 +214,7 @@ impl<'a> Msg<'a> {
         }
     }
 
+    #[inline]
     fn gathered(&self, number: u32) -> Option<&'a Found> {
         let g = self.gathered?;
         g.dispatch.get(number).map(|s| &g.found[s])
@@ -244,7 +245,40 @@ impl<'a> Msg<'a> {
         self.read(&Read::of(md, &md.fields()[index], self.pool))
     }
 
+    /// A singular field's occurrences.
+    #[inline]
+    pub fn found(&self, read: &Read) -> Found {
+        match self.gathered(read.shape.number) {
+            Some(found) => *found,
+            None => wire::singular(&self.src, &read.shape, self.pool).unwrap_or_default(),
+        }
+    }
+
+    /// A singular scalar field's value; an enum's number is an int.
+    #[inline]
+    pub fn prim(&self, read: &Read, s: ScalarType) -> Prim<'a> {
+        let last = match self.gathered(read.shape.number) {
+            Some(found) => found.last(&self.src),
+            None => wire::singular(&self.src, &read.shape, self.pool)
+                .ok()
+                .and_then(|f| f.last(&self.src)),
+        };
+        last.map_or(zero(s), |raw| prim(raw, s))
+    }
+
+    /// A singular message field, merged from its occurrences.
+    #[inline]
+    pub fn child(&self, read: &Read, index: MessageIndex) -> Self {
+        let found = self.found(read);
+        Self::new(
+            found.message(&self.src, read.shape.number),
+            index,
+            self.pool,
+        )
+    }
+
     /// Reads a field whose [`Read`] was worked out when compiling.
+    #[inline]
     pub fn read(&self, read: &Read) -> Value<'a> {
         let shape = &read.shape;
         let gathered = self.gathered(shape.number);
@@ -337,27 +371,16 @@ pub fn present(found: &Found, read: &Read, src: &Src<'_>, pool: &Arc<DescriptorP
                 || scan_has(&src.within(found.span), read, pool)
         }
         (Card::Singular, Some(raw)) => match read.shape.kind {
-            Kind::Scalar(s) => !is_zero_scalar(&scalar(raw, s)),
-            Kind::Enum(_) => !is_zero_scalar(&scalar(raw, ScalarType::Int32)),
+            Kind::Scalar(s) => !prim(raw, s).is_zero(),
+            Kind::Enum(_) => !prim(raw, ScalarType::Int32).is_zero(),
             Kind::Message(_) => true,
         },
     }
 }
 
-fn is_zero_scalar(v: &Value<'_>) -> bool {
-    match v {
-        Value::Bool(b) => !b,
-        Value::Int(i) => *i == 0,
-        Value::Uint(u) => *u == 0,
-        Value::Double(d) => *d == 0.0,
-        Value::String(s) => s.is_empty(),
-        Value::Bytes(b) => b.is_empty(),
-        _ => false,
-    }
-}
-
 /// A singular field's value: its last occurrence, its occurrences merged,
 /// or its default.
+#[inline]
 pub fn singular<'a>(
     found: &Found,
     parent: &Src<'a>,
@@ -380,6 +403,7 @@ pub fn singular<'a>(
 }
 
 /// One occurrence's value: a scalar, or one message (not merged).
+#[inline]
 #[expect(clippy::cast_possible_truncation, reason = "the wire's truncations")]
 #[expect(clippy::cast_possible_wrap, reason = "the wire's reinterpretations")]
 pub fn element<'a>(
@@ -398,35 +422,102 @@ pub fn element<'a>(
     }
 }
 
-/// A scalar occurrence's value.
+/// A scalar occurrence's value, before it is a CEL value.
+#[derive(Clone, Copy)]
+pub enum Prim<'a> {
+    Int(i64),
+    Uint(u64),
+    Double(f64),
+    Bool(bool),
+    /// A string's bytes, which a valid encoding holds as UTF-8.
+    Str(&'a [u8]),
+    Bytes(&'a [u8]),
+}
+
+/// Decodes a scalar occurrence.
 #[expect(clippy::cast_possible_truncation, reason = "the wire's truncations")]
 #[expect(clippy::cast_possible_wrap, reason = "the wire's reinterpretations")]
 #[inline]
-pub fn scalar(raw: Raw<'_>, s: ScalarType) -> Value<'_> {
+pub fn prim(raw: Raw<'_>, s: ScalarType) -> Prim<'_> {
     match (s, raw) {
-        (ScalarType::Int32, Raw::Varint(v)) => Value::Int(i64::from(v as i32)),
-        (ScalarType::Int64, Raw::Varint(v)) => Value::Int(v as i64),
-        (ScalarType::Uint32, Raw::Varint(v)) => Value::Uint(u64::from(v as u32)),
-        (ScalarType::Uint64, Raw::Varint(v)) | (ScalarType::Fixed64, Raw::I64(v)) => Value::Uint(v),
+        (ScalarType::Int32, Raw::Varint(v)) => Prim::Int(i64::from(v as i32)),
+        (ScalarType::Int64, Raw::Varint(v)) => Prim::Int(v as i64),
+        (ScalarType::Uint32, Raw::Varint(v)) => Prim::Uint(u64::from(v as u32)),
+        (ScalarType::Uint64, Raw::Varint(v)) | (ScalarType::Fixed64, Raw::I64(v)) => Prim::Uint(v),
         (ScalarType::Sint32, Raw::Varint(v)) => {
             let v = v as u32;
-            Value::Int(i64::from((v >> 1) as i32 ^ -((v & 1) as i32)))
+            Prim::Int(i64::from((v >> 1) as i32 ^ -((v & 1) as i32)))
         }
-        (ScalarType::Sint64, Raw::Varint(v)) => Value::Int((v >> 1) as i64 ^ -((v & 1) as i64)),
-        (ScalarType::Bool, Raw::Varint(v)) => Value::Bool(v != 0),
-        (ScalarType::Sfixed64, Raw::I64(v)) => Value::Int(v as i64),
-        (ScalarType::Double, Raw::I64(v)) => Value::Double(f64::from_bits(v)),
-        (ScalarType::Fixed32, Raw::I32(v)) => Value::Uint(u64::from(v)),
-        (ScalarType::Sfixed32, Raw::I32(v)) => Value::Int(i64::from(v as i32)),
-        (ScalarType::Float, Raw::I32(v)) => Value::Double(f64::from(f32::from_bits(v))),
-        (ScalarType::String, Raw::Len(b)) => match std::str::from_utf8(b) {
-            Ok(s) => Value::String(Str::Ref(s)),
-            // Not a valid encoding, which decoding rejects; read leniently.
-            Err(_) => Value::String(Str::Rc(String::from_utf8_lossy(b).into())),
-        },
-        (ScalarType::Bytes, Raw::Len(b)) => Value::Bytes(Bin::Ref(b)),
-        (s, _) => default_scalar(s),
+        (ScalarType::Sint64, Raw::Varint(v)) => Prim::Int((v >> 1) as i64 ^ -((v & 1) as i64)),
+        (ScalarType::Bool, Raw::Varint(v)) => Prim::Bool(v != 0),
+        (ScalarType::Sfixed64, Raw::I64(v)) => Prim::Int(v as i64),
+        (ScalarType::Double, Raw::I64(v)) => Prim::Double(f64::from_bits(v)),
+        (ScalarType::Fixed32, Raw::I32(v)) => Prim::Uint(u64::from(v)),
+        (ScalarType::Sfixed32, Raw::I32(v)) => Prim::Int(i64::from(v as i32)),
+        (ScalarType::Float, Raw::I32(v)) => Prim::Double(f64::from(f32::from_bits(v))),
+        (ScalarType::String, Raw::Len(b)) => Prim::Str(b),
+        (ScalarType::Bytes, Raw::Len(b)) => Prim::Bytes(b),
+        (s, _) => zero(s),
     }
+}
+
+/// A scalar type's zero.
+pub const fn zero(s: ScalarType) -> Prim<'static> {
+    match s {
+        ScalarType::Double | ScalarType::Float => Prim::Double(0.0),
+        ScalarType::Int64
+        | ScalarType::Sfixed64
+        | ScalarType::Sint64
+        | ScalarType::Int32
+        | ScalarType::Sfixed32
+        | ScalarType::Sint32 => Prim::Int(0),
+        ScalarType::Uint64 | ScalarType::Fixed64 | ScalarType::Uint32 | ScalarType::Fixed32 => {
+            Prim::Uint(0)
+        }
+        ScalarType::Bool => Prim::Bool(false),
+        ScalarType::String => Prim::Str(&[]),
+        ScalarType::Bytes => Prim::Bytes(&[]),
+    }
+}
+
+impl<'a> Prim<'a> {
+    #[inline]
+    pub fn is_zero(self) -> bool {
+        match self {
+            Self::Int(i) => i == 0,
+            Self::Uint(u) => u == 0,
+            Self::Double(d) => d == 0.0,
+            Self::Bool(b) => !b,
+            Self::Str(b) | Self::Bytes(b) => b.is_empty(),
+        }
+    }
+
+    #[inline]
+    pub fn value(self) -> Value<'a> {
+        match self {
+            Self::Int(i) => Value::Int(i),
+            Self::Uint(u) => Value::Uint(u),
+            Self::Double(d) => Value::Double(d),
+            Self::Bool(b) => Value::Bool(b),
+            Self::Str(b) => Value::String(utf8(b)),
+            Self::Bytes(b) => Value::Bytes(Bin::Ref(b)),
+        }
+    }
+}
+
+/// A string field's bytes as a string.
+pub fn utf8(b: &[u8]) -> Str<'_> {
+    match std::str::from_utf8(b) {
+        Ok(s) => Str::Ref(s),
+        // Not a valid encoding, which decoding rejects; read leniently.
+        Err(_) => Str::Rc(String::from_utf8_lossy(b).into()),
+    }
+}
+
+/// A scalar occurrence's value.
+#[inline]
+pub fn scalar(raw: Raw<'_>, s: ScalarType) -> Value<'_> {
+    prim(raw, s).value()
 }
 
 /// Which well-known type a message is, if any.
@@ -512,22 +603,8 @@ fn json_value<'a>(m: &Msg<'a>) -> Value<'a> {
     Value::Null
 }
 
-pub const fn default_scalar(s: ScalarType) -> Value<'static> {
-    match s {
-        ScalarType::Double | ScalarType::Float => Value::Double(0.0),
-        ScalarType::Int64
-        | ScalarType::Sfixed64
-        | ScalarType::Sint64
-        | ScalarType::Int32
-        | ScalarType::Sfixed32
-        | ScalarType::Sint32 => Value::Int(0),
-        ScalarType::Uint64 | ScalarType::Fixed64 | ScalarType::Uint32 | ScalarType::Fixed32 => {
-            Value::Uint(0)
-        }
-        ScalarType::Bool => Value::Bool(false),
-        ScalarType::String => Value::String(Str::Ref("")),
-        ScalarType::Bytes => Value::Bytes(Bin::Ref(&[])),
-    }
+pub fn default_scalar(s: ScalarType) -> Value<'static> {
+    zero(s).value()
 }
 
 impl<'a> Field<'a> {
