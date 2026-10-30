@@ -23,20 +23,21 @@ pub fn format(template: &str, args: &List<'_>) -> Result<String, Error> {
             out.push('%');
             continue;
         }
-        let mut precision = None;
-        if chars.peek() == Some(&'.') {
+        let precision = if chars.peek() == Some(&'.') {
             chars.next();
             let mut digits = String::new();
             while let Some(d) = chars.peek().copied().filter(char::is_ascii_digit) {
                 digits.push(d);
                 chars.next();
             }
-            precision = Some(
+            Some(
                 digits
                     .parse::<usize>()
                     .map_err(|_| Error::new("invalid precision"))?,
-            );
-        }
+            )
+        } else {
+            None
+        };
         let verb = chars
             .next()
             .ok_or_else(|| Error::new("format: unterminated verb"))?;
@@ -125,7 +126,7 @@ fn double(d: f64) -> String {
         } else {
             "-Inf".into()
         }
-    } else if d == d.trunc() && d.abs() < 1e21 {
+    } else if d.fract() == 0.0 && d.abs() < 1e21 {
         format!("{d:.0}")
     } else {
         format!("{d}")
@@ -197,10 +198,10 @@ pub fn to_text(v: &Value<'_>) -> Result<String, Error> {
             out
         }
         Value::Message(m) => {
-            if m.descriptor().full_name() == "google.protobuf.FieldMask" {
-                if let Some(Value::List(paths)) = m.field_by_name("paths") {
-                    return to_text(&Value::List(paths));
-                }
+            if m.descriptor().full_name() == "google.protobuf.FieldMask"
+                && let Some(Value::List(paths)) = m.field_by_name("paths")
+            {
+                return to_text(&Value::List(paths));
             }
             format!("{}{{}}", m.descriptor().full_name())
         }

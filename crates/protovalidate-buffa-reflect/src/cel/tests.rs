@@ -83,7 +83,7 @@ fn message(pool: &Arc<DescriptorPool>) -> DynamicMessage {
     let mut m = DynamicMessage::new_by_name(Arc::clone(pool), "t.Test").expect("declared");
     let md = pool.message_by_name("t.Test").expect("declared");
     let set = |m: &mut DynamicMessage, name: &str, v: V| {
-        m.set(md.field_by_name(name).expect("declared"), v)
+        m.set(md.field_by_name(name).expect("declared"), v);
     };
     set(&mut m, "a", V::I32(5));
     set(&mut m, "s", V::String("héllo".into()));
@@ -130,14 +130,13 @@ fn both(source: &str) -> (String, String) {
         Ok(None) => "pass".into(),
         Err(_) => "compile error".into(),
     };
-    let interpreted = match fallback::Program::compile(source, &bindings) {
-        Ok(p) => show(p.eval(&this, &clock)),
-        Err(_) => "compile error".into(),
-    };
+    let interpreted = fallback::Program::compile(source, &bindings)
+        .map_or_else(|_| "compile error".into(), |p| show(p.eval(&this, &clock)));
     (compiled, interpreted)
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "a table of expressions")]
 fn compiled_agrees_with_the_interpreter() {
     let expressions = [
         "this.a > 3",

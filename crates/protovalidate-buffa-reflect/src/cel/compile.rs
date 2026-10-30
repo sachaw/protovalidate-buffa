@@ -228,7 +228,7 @@ impl Compiler<'_> {
                     });
                     items.push(n);
                 }
-                Ok(self.fold(
+                Ok(fold(
                     Node::List(items.into()),
                     Ty::List(Box::new(elem.unwrap_or(Ty::Dyn))),
                 ))
@@ -246,7 +246,7 @@ impl Compiler<'_> {
                     let (v, _) = self.expr(&entry.value)?;
                     entries.push((k, v));
                 }
-                Ok(self.fold(
+                Ok(fold(
                     Node::Map(entries.into()),
                     Ty::Map(Box::new(Ty::Dyn), Box::new(Ty::Dyn)),
                 ))
@@ -284,9 +284,9 @@ impl Compiler<'_> {
                 let fd = &md.fields()[index];
                 let index = u32::try_from(index).map_err(|_| Refusal::Unsupported)?;
                 Ok(if test {
-                    self.fold(Node::Has(Box::new(operand), index), Ty::Bool)
+                    fold(Node::Has(Box::new(operand), index), Ty::Bool)
                 } else {
-                    self.fold(
+                    fold(
                         Node::Field(Box::new(operand), index, Read::of(fd, self.pool)),
                         Ty::of_field(fd, self.pool),
                     )
@@ -295,31 +295,20 @@ impl Compiler<'_> {
             Ty::Map(_, v) => {
                 let v = (**v).clone();
                 Ok(if test {
-                    self.fold(Node::HasName(Box::new(operand), field.into()), Ty::Bool)
+                    fold(Node::HasName(Box::new(operand), field.into()), Ty::Bool)
                 } else {
-                    self.fold(Node::Get(Box::new(operand), field.into()), v)
+                    fold(Node::Get(Box::new(operand), field.into()), v)
                 })
             }
             Ty::Dyn => Ok(if test {
-                self.fold(Node::HasName(Box::new(operand), field.into()), Ty::Bool)
+                fold(Node::HasName(Box::new(operand), field.into()), Ty::Bool)
             } else {
-                self.fold(Node::Get(Box::new(operand), field.into()), Ty::Dyn)
+                fold(Node::Get(Box::new(operand), field.into()), Ty::Dyn)
             }),
             other => error(format!(
                 "type '{}' does not support field selection",
                 other.name(self.pool)
             )),
-        }
-    }
-
-    /// Replaces a node whose inputs are all known with its value.
-    fn fold(&self, node: Node, ty: Ty) -> (Node, Ty) {
-        if !closed(&node, 0) {
-            return (node, ty);
-        }
-        match eval::constant(&node) {
-            Ok(v) => (Node::Const(v.to_const()), ty),
-            Err(_) => (node, ty),
         }
     }
 
@@ -336,7 +325,7 @@ impl Compiler<'_> {
             (op::LOGICAL_NOT, false, 1) => {
                 let (a, at) = self.expr(&c.args[0])?;
                 self.expect(name, &[at], &[Ty::Bool])?;
-                Ok(self.fold(Node::Not(Box::new(a)), Ty::Bool))
+                Ok(fold(Node::Not(Box::new(a)), Ty::Bool))
             }
             (op::NOT_STRICTLY_FALSE, false, 1) => Err(Refusal::Unsupported),
             (op::NEGATE, false, 1) => {
@@ -344,7 +333,7 @@ impl Compiler<'_> {
                 if !matches!(at, Ty::Int | Ty::Double | Ty::Dyn | Ty::Duration) {
                     return self.no_overload(name, &[at]);
                 }
-                Ok(self.fold(Node::Neg(Box::new(a)), at))
+                Ok(fold(Node::Neg(Box::new(a)), at))
             }
             (op::CONDITIONAL, false, 3) => {
                 let (p, pt) = self.expr(&c.args[0])?;
@@ -357,10 +346,10 @@ impl Compiler<'_> {
                     Node::Const(Const::Bool(false)) => (f, ty),
                     p => match (t, f) {
                         (Node::Const(t), Node::Const(f)) => match p {
-                            Node::Not(p) => self.fold(Node::Choose(Box::new((*p, f, t))), ty),
-                            p => self.fold(Node::Choose(Box::new((p, t, f))), ty),
+                            Node::Not(p) => fold(Node::Choose(Box::new((*p, f, t))), ty),
+                            p => fold(Node::Choose(Box::new((p, t, f))), ty),
                         },
-                        (t, f) => self.fold(Node::Cond(Box::new([p, t, f])), ty),
+                        (t, f) => fold(Node::Cond(Box::new([p, t, f])), ty),
                     },
                 })
             }
@@ -385,7 +374,7 @@ impl Compiler<'_> {
                 let (b, bt) = self.expr(&c.args[1])?;
                 let o = binary_op(name);
                 let ty = self.binary_type(name, o, &at, &bt)?;
-                Ok(self.fold(binary(o, a, b), ty))
+                Ok(fold(binary(o, a, b), ty))
             }
             ("dyn", false, 1) => {
                 let (a, _) = self.expr(&c.args[0])?;
@@ -432,7 +421,7 @@ impl Compiler<'_> {
             (f, 1) => Node::Call1(f, Box::new(args.pop().expect("one argument"))),
             (f, _) => Node::Call(f, args.into()),
         };
-        Ok(self.fold(node, ty))
+        Ok(fold(node, ty))
     }
 
     fn expect(&self, name: &str, got: &[Ty], want: &[Ty]) -> Result<()> {
@@ -451,6 +440,7 @@ impl Compiler<'_> {
         ))
     }
 
+    #[expect(clippy::many_single_char_names, reason = "a table of operand types")]
     fn binary_type(&self, name: &str, o: Op, a: &Ty, b: &Ty) -> Result<Ty> {
         use Ty as T;
         let either_dyn = a.is_dyn() || b.is_dyn();
@@ -668,19 +658,19 @@ impl Compiler<'_> {
         let var = self.next;
         self.next += 1;
         self.used = self.used.max(self.next);
-        self.locals.push((c.iter_var.clone(), var_ty.clone(), var));
+        self.locals.push((c.iter_var.clone(), var_ty, var));
         let result = self.comprehension_body(&shape);
         self.locals.pop();
         self.next -= 1;
         let (kind, test, transform, ty) = result?;
-        let fold = Fold {
+        let comprehension = Fold {
             kind,
             range,
             var,
             test,
             transform,
         };
-        Ok(self.fold(Node::Fold(Box::new(fold)), ty))
+        Ok(fold(Node::Fold(Box::new(comprehension)), ty))
     }
 
     fn comprehension_body(
@@ -714,6 +704,17 @@ impl Compiler<'_> {
     }
 }
 
+/// Replaces a node whose inputs are all known with its value.
+fn fold(node: Node, ty: Ty) -> (Node, Ty) {
+    if !closed(&node, 0) {
+        return (node, ty);
+    }
+    match eval::constant(&node) {
+        Ok(v) => (Node::Const(v.to_const()), ty),
+        Err(_) => (node, ty),
+    }
+}
+
 /// A binary operation; a comparison against a constant is fused.
 fn binary(o: Op, a: Node, b: Node) -> Node {
     if !matches!(o, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge) {
@@ -725,7 +726,7 @@ fn binary(o: Op, a: Node, b: Node) -> Node {
         (Node::Const(c), Node::This) => Node::CompareThis(flip(o), Box::new(c)),
         (a, Node::Const(c)) => Node::Compare(o, Box::new((a, c))),
         (Node::Const(c), b) => Node::Compare(flip(o), Box::new((b, c))),
-        (a, b) => Node::Op(o, Box::new([a, b])),
+        pair => Node::Op(o, Box::new(pair.into())),
     }
 }
 
@@ -747,8 +748,8 @@ fn logic(and: bool, a: Node, b: Node) -> Node {
             Node::Const(Const::Bool(absorbing))
         }
         (Node::Const(Const::Bool(_)), n) | (n, Node::Const(Const::Bool(_))) => n,
-        (a, b) if and => Node::And(Box::new([a, b])),
-        (a, b) => Node::Or(Box::new([a, b])),
+        pair if and => Node::And(Box::new(pair.into())),
+        pair => Node::Or(Box::new(pair.into())),
     }
 }
 
@@ -756,22 +757,23 @@ fn logic(and: bool, a: Node, b: Node) -> Node {
 fn closed(n: &Node, bound: u16) -> bool {
     match n {
         Node::Const(_) => true,
-        Node::This | Node::Now => false,
+        Node::This | Node::Now | Node::CompareThis(..) => false,
         Node::Local(s) => bound & (1 << s) != 0,
         Node::Field(x, ..)
         | Node::Has(x, _)
         | Node::Get(x, _)
         | Node::HasName(x, _)
         | Node::Not(x)
-        | Node::Neg(x) => closed(x, bound),
+        | Node::Neg(x)
+        | Node::Call1(_, x)
+        | Node::Match(x, _)
+        | Node::Size(x, _) => closed(x, bound),
         Node::And(xs) | Node::Or(xs) | Node::Op(_, xs) => xs.iter().all(|x| closed(x, bound)),
         Node::Cond(xs) => xs.iter().all(|x| closed(x, bound)),
         Node::List(xs) | Node::Call(_, xs) => xs.iter().all(|x| closed(x, bound)),
         Node::Map(es) => es.iter().all(|(k, v)| closed(k, bound) && closed(v, bound)),
-        Node::CompareThis(..) => false,
         Node::Compare(_, x) => closed(&x.0, bound),
         Node::Choose(x) => closed(&x.0, bound),
-        Node::Call1(_, x) | Node::Match(x, _) | Node::Size(x, _) => closed(x, bound),
         Node::Fold(f) => {
             let inner = bound | (1 << f.var);
             closed(&f.range, bound)
@@ -791,16 +793,18 @@ enum Shape<'e> {
     },
 }
 
+/// A call without a receiver.
+const fn call(e: &IdedExpr) -> Option<&CallExpr> {
+    match &e.expr {
+        Expr::Call(call) if call.target.is_none() => Some(call),
+        _ => None,
+    }
+}
+
 /// Recognizes the comprehensions `cel`'s macros expand to.
 fn macro_shape(c: &ComprehensionExpr) -> Option<Shape<'_>> {
     let accu = c.accu_var.as_str();
     let is_accu = |e: &IdedExpr| matches!(&e.expr, Expr::Ident(n) if n == accu);
-    fn call(e: &IdedExpr) -> Option<&CallExpr> {
-        match &e.expr {
-            Expr::Call(call) if call.target.is_none() => Some(call),
-            _ => None,
-        }
-    }
     let lit_bool = |e: &IdedExpr| match &e.expr {
         Expr::Literal(LiteralValue::Boolean(b)) => Some(bool::from(*b)),
         _ => None,

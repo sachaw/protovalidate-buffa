@@ -15,8 +15,8 @@ use buffa::{
     unknown_fields::{UnknownFieldData, UnknownFields},
 };
 use buffa_descriptor::{
-    DescriptorPool, FieldDescriptor, FieldKind, MessageDescriptor, MessageIndex, ScalarType,
-    SingularKind,
+    DescriptorPool, EnumValueDescriptor, FieldDescriptor, FieldKind, MessageDescriptor,
+    MessageIndex, ScalarType, SingularKind,
     features::FieldPresence,
     reflect::{DynamicMessage, ReflectCow, ReflectMessage, ValueRef},
 };
@@ -107,7 +107,7 @@ pub struct Rule {
 }
 
 impl ValuePlan {
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.checks.is_empty()
             && self.message.is_none()
             && self.items.is_none()
@@ -158,7 +158,7 @@ fn extension(
     ext: Ext,
 ) -> Option<DynamicMessage> {
     let mut bytes = Vec::new();
-    for f in unknown.iter() {
+    for f in unknown {
         if f.number == ext.number
             && let UnknownFieldData::LengthDelimited(data) = &f.data
         {
@@ -555,9 +555,9 @@ impl<'p> Builder<'p> {
             }
             let this = match (wkt, message) {
                 (Some(Wkt::Wrapper), Some(m)) => Ty::of_scalar(wrapped(pool.message(m))),
-                _ => this.clone(),
+                _ => this,
             };
-            self.standard(&mut plan, type_fd, type_rules, this, fd, singular, prefix)?;
+            self.standard(&mut plan, type_fd, type_rules, &this, fd, singular, prefix)?;
         }
 
         if let (Site::Field, FieldKind::Map { .. }) = (site, fd.kind()) {
@@ -619,13 +619,17 @@ impl<'p> Builder<'p> {
     }
 
     /// The standard and predefined rules set in a `FieldRules.type` message.
-    #[expect(clippy::too_many_arguments, reason = "the value's whole context")]
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the value's whole context; native rules, then predefined rules"
+    )]
     fn standard(
         &self,
         plan: &mut ValuePlan,
         type_fd: &FieldDescriptor,
         type_rules: &DynamicMessage,
-        this: Ty,
+        this: &Ty,
         fd: &FieldDescriptor,
         singular: Option<SingularKind>,
         prefix: &[Elem],
@@ -674,7 +678,7 @@ impl<'p> Builder<'p> {
                         .enumeration(e)
                         .values()
                         .iter()
-                        .map(|v| v.number())
+                        .map(EnumValueDescriptor::number)
                         .collect();
                     values.sort_unstable();
                     let mut path = prefix.to_vec();

@@ -12,7 +12,7 @@ use super::{
     compile::{Func, Op, Time},
     eval::select,
     format,
-    value::{Bin, List, Str, Type, Value, equals},
+    value::{Bin, List, Str, Value, equals},
 };
 
 /// The bounds of CEL's timestamps: years 1 through 9999.
@@ -55,6 +55,7 @@ fn timestamp<'a>(t: Option<DateTime<Utc>>) -> Result<Value<'a>, Error> {
     }
 }
 
+#[expect(clippy::many_single_char_names, reason = "an operator's operands")]
 pub fn arithmetic<'a>(op: Op, a: &Value<'a>, b: &Value<'a>) -> Result<Value<'a>, Error> {
     let name = match op {
         Op::Add => "_+_",
@@ -134,7 +135,7 @@ pub fn arithmetic<'a>(op: Op, a: &Value<'a>, b: &Value<'a>) -> Result<Value<'a>,
     }
 }
 
-fn string<'v, 'a>(v: &'v Value<'a>, name: &str) -> Result<&'v str, Error> {
+fn string<'v>(v: &'v Value<'_>, name: &str) -> Result<&'v str, Error> {
     match v {
         Value::String(s) => Ok(s),
         other => Err(overload(name, std::slice::from_ref(other))),
@@ -183,15 +184,17 @@ pub fn call<'a>(func: &Func, args: &[Value<'a>]) -> Result<Value<'a>, Error> {
         }
         Func::Matches(re) => {
             let s = string(arg(0)?, "matches")?;
-            let matched = match re {
-                Some(re) => re.is_match(s),
-                None => {
+            let matched = re.as_ref().map_or_else(
+                || {
                     let pattern = string(arg(1)?, "matches")?;
-                    Regex::new(pattern)
-                        .map_err(|e| Error::new(format!("invalid regular expression: {e}")))?
-                        .is_match(s)
-                }
-            };
+                    Ok::<_, Error>(
+                        Regex::new(pattern)
+                            .map_err(|e| Error::new(format!("invalid regular expression: {e}")))?
+                            .is_match(s),
+                    )
+                },
+                |re| Ok(re.is_match(s)),
+            )?;
             Value::Bool(matched)
         }
         Func::IsEmail => Value::Bool(rules::is_email(string(arg(0)?, "isEmail")?)),
@@ -334,13 +337,11 @@ pub fn call<'a>(func: &Func, args: &[Value<'a>]) -> Result<Value<'a>, Error> {
             let s = string(arg(0)?, "replace")?;
             let from = string(arg(1)?, "replace")?;
             let to = string(arg(2)?, "replace")?;
-            Value::str(match args.get(3) {
-                Some(n) => match usize::try_from(int(n, "replace")?) {
-                    Ok(n) => s.replacen(from, to, n),
-                    Err(_) => s.replace(from, to),
-                },
-                None => s.replace(from, to),
-            })
+            let limit = match args.get(3) {
+                Some(n) => usize::try_from(int(n, "replace")?).ok(),
+                None => None,
+            };
+            Value::str(limit.map_or_else(|| s.replace(from, to), |n| s.replacen(from, to, n)))
         }
         Func::Split => {
             let s = string(arg(0)?, "split")?;
@@ -485,9 +486,7 @@ enum Key {
 
 #[expect(
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    reason = "CEL's conversions, range-checked"
+    reason = "CEL's conversion, range-checked"
 )]
 fn to_int<'a>(v: &Value<'a>) -> Result<Value<'a>, Error> {
     Ok(Value::Int(match v {
@@ -662,13 +661,4 @@ fn named_zone(ts: DateTime<Utc>, zone: &str) -> Result<Fields, Error> {
     Err(Error::new(format!(
         "time zone {zone:?} needs the `tz` feature"
     )))
-}
-
-impl Type {
-    pub const fn is_scalar(self) -> bool {
-        matches!(
-            self,
-            Self::Bool | Self::Int | Self::Uint | Self::Double | Self::String | Self::Bytes
-        )
-    }
 }

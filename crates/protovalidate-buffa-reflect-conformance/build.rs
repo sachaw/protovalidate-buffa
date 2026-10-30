@@ -30,15 +30,15 @@ fn main() {
     println!("cargo:rerun-if-changed={}", protos.display());
     println!("cargo:rerun-if-env-changed=PROTOC");
 
-    let protoc = protoc();
-    let include = Path::new(&protoc)
+    let compiler = protoc();
+    let include = Path::new(&compiler)
         .parent()
         .and_then(Path::parent)
         .map(|prefix| prefix.join("include"))
         .filter(|p| p.join("google/protobuf/descriptor.proto").exists())
         .expect("protoc's include directory");
     let descriptors = |out: &Path, files: &[&str]| {
-        let status = std::process::Command::new(&protoc)
+        let status = std::process::Command::new(&compiler)
             .arg(format!("--descriptor_set_out={}", out.display()))
             .arg("--include_imports")
             .arg(format!("-I{}", protos.display()))

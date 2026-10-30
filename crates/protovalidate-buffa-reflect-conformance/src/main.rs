@@ -51,7 +51,7 @@ fn main() -> anyhow::Result<()> {
             let ValueRef::Message(any) = any else { return };
             match run(&harness, &cases, &validator, &*any) {
                 Ok(result) => {
-                    results.push((MapKey::String(name.to_owned()), Value::Message(result)))
+                    results.push((MapKey::String(name.to_owned()), Value::Message(result)));
                 }
                 Err(e) => err = Some(e),
             }

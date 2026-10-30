@@ -140,6 +140,7 @@ impl Program {
     }
 
     /// Whether this expression runs on the interpreter.
+    #[cfg(test)]
     pub const fn is_fallback(&self) -> bool {
         matches!(self.0, Kind::Fallback(_))
     }

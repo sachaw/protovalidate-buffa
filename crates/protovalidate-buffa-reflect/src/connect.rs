@@ -89,10 +89,7 @@ impl Inner {
             }),
             _ => None,
         };
-        match message {
-            Some(message) => self.validator.check(&message),
-            None => Ok(()),
-        }
+        message.map_or(Ok(()), |message| self.validator.check(&message))
     }
 }
 

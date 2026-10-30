@@ -75,6 +75,7 @@ fn message<'v, 'a>(v: &'v Value<'a>) -> Result<&'v Msg<'a>, Error> {
     }
 }
 
+#[expect(clippy::many_single_char_names, reason = "an evaluator's operands")]
 fn eval<'a>(node: &'a Node, f: &mut Frame<'a, '_, '_>) -> Result<Value<'a>, Error> {
     Ok(match node {
         Node::Const(c) => Value::from_const(c),
@@ -171,7 +172,7 @@ fn operand<'a, 'f>(
     x: &'a Node,
     f: &'f mut Frame<'a, '_, '_>,
 ) -> Result<std::borrow::Cow<'f, Value<'a>>, Error> {
-    if let Node::This = x {
+    if matches!(x, Node::This) {
         Ok(std::borrow::Cow::Borrowed(f.this))
     } else {
         eval(x, f).map(std::borrow::Cow::Owned)
@@ -313,10 +314,11 @@ fn logic<'a>(
 }
 
 /// Orders two values of the same scalar type, the common case, without the
-/// general comparison's dispatch. `None` for any other pair.
+/// general comparison's dispatch. `Err` for any other pair; `Ok(None)` for
+/// NaN.
 #[inline]
-fn same_type_order(a: &Value<'_>, b: &Value<'_>) -> Option<Option<std::cmp::Ordering>> {
-    Some(match (a, b) {
+fn same_type_order(a: &Value<'_>, b: &Value<'_>) -> Result<Option<std::cmp::Ordering>, ()> {
+    Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
         (Value::Uint(x), Value::Uint(y)) => Some(x.cmp(y)),
         (Value::Double(x), Value::Double(y)) => x.partial_cmp(y),
@@ -325,7 +327,7 @@ fn same_type_order(a: &Value<'_>, b: &Value<'_>) -> Option<Option<std::cmp::Orde
         (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
         (Value::Duration(x), Value::Duration(y)) => Some(x.cmp(y)),
         (Value::Timestamp(x), Value::Timestamp(y)) => Some(x.cmp(y)),
-        _ => return None,
+        _ => return Err(()),
     })
 }
 
@@ -333,7 +335,7 @@ fn same_type_order(a: &Value<'_>, b: &Value<'_>) -> Option<Option<std::cmp::Orde
 pub fn binary<'a>(op: Op, a: &Value<'a>, b: &Value<'a>) -> Result<Value<'a>, Error> {
     use std::cmp::Ordering as O;
     if matches!(op, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge)
-        && let Some(order) = same_type_order(a, b)
+        && let Ok(order) = same_type_order(a, b)
     {
         return Ok(Value::Bool(match (op, order) {
             (Op::Eq, o) => o == Some(O::Equal),
@@ -444,13 +446,13 @@ fn comprehension<'a>(fold: &'a Fold, f: &mut Frame<'a, '_, '_>) -> Result<Value<
     let mut error: Option<Error> = None;
     match fold.kind {
         FoldKind::All | FoldKind::Exists => {
-            let decides = fold.kind == FoldKind::Exists;
-            let test = fold.test.as_ref().expect("all and exists have a predicate");
+            let deciding = fold.kind == FoldKind::Exists;
+            let predicate = fold.test.as_ref().expect("all and exists have a predicate");
             let mut decided = false;
             each(&range, &mut |item| {
                 f.locals[var] = item;
-                match eval(test, f).and_then(|v| boolean(&v, "predicate")) {
-                    Ok(b) if b == decides => {
+                match eval(predicate, f).and_then(|v| boolean(&v, "predicate")) {
+                    Ok(b) if b == deciding => {
                         decided = true;
                         false
                     }
@@ -462,9 +464,9 @@ fn comprehension<'a>(fold: &'a Fold, f: &mut Frame<'a, '_, '_>) -> Result<Value<
                 }
             })?;
             if decided {
-                return Ok(Value::Bool(decides));
+                return Ok(Value::Bool(deciding));
             }
-            error.map_or(Ok(Value::Bool(!decides)), Err)
+            error.map_or(Ok(Value::Bool(!deciding)), Err)
         }
         FoldKind::ExistsOne => {
             let test = fold.test.as_ref().expect("exists_one has a predicate");
@@ -489,10 +491,10 @@ fn comprehension<'a>(fold: &'a Fold, f: &mut Frame<'a, '_, '_>) -> Result<Value<
             let mut out = Vec::new();
             each(&range, &mut |item| {
                 f.locals[var] = item;
-                let keep = match &fold.test {
-                    Some(t) => eval(t, f).and_then(|v| boolean(&v, "filter")),
-                    None => Ok(true),
-                };
+                let keep = fold
+                    .test
+                    .as_ref()
+                    .map_or(Ok(true), |t| eval(t, f).and_then(|v| boolean(&v, "filter")));
                 match keep.and_then(|k| {
                     if k {
                         eval(transform, f).map(Some)

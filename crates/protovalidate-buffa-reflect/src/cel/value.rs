@@ -78,6 +78,10 @@ pub enum Map<'a> {
 
 /// A CEL type, as `type()` returns it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "`type` is CEL's name for the type of types"
+)]
 pub enum Type {
     Null,
     Bool,
@@ -401,9 +405,7 @@ pub fn message_as(m: Msg<'_>, w: Option<Wkt>) -> Value<'_> {
                 .map_or(Value::Message(m), Value::Duration),
             None => Value::Message(m),
         },
-        Some(Wkt::Wrapper) => m.field(0),
-        Some(Wkt::Struct) => m.field(0),
-        Some(Wkt::ListValue) => m.field(0),
+        Some(Wkt::Wrapper | Wkt::Struct | Wkt::ListValue) => m.field(0),
         Some(Wkt::Value) => json_value(&m),
         _ => Value::Message(m),
     }
@@ -521,7 +523,7 @@ impl<'a> Map<'a> {
                 }
             }
             Self::Const(m) => {
-                for (k, v) in m.iter() {
+                for (k, v) in &**m {
                     if !f(Value::from_const(k), Value::from_const(v)) {
                         break;
                     }
@@ -574,14 +576,17 @@ fn int_key(key: &Value<'_>, kt: ScalarType) -> Option<MapKey> {
                 clippy::cast_possible_truncation,
                 reason = "integral and range-checked"
             )]
-            let i =
-                (d >= -9.223_372_036_854_776e18 && d < 9.223_372_036_854_776e18).then(|| d as i64);
+            let i = (-9.223_372_036_854_776e18..9.223_372_036_854_776e18)
+                .contains(&d)
+                .then_some(d as i64);
             #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
                 reason = "integral and range-checked"
             )]
-            let u = (d >= 0.0 && d < 1.844_674_407_370_955_2e19).then(|| d as u64);
+            let u = (0.0..1.844_674_407_370_955_2e19)
+                .contains(&d)
+                .then_some(d as u64);
             (i, u)
         }
         _ => return None,
@@ -681,6 +686,7 @@ impl<'a> Value<'a> {
 
 /// CEL's heterogeneous equality: values of different types are unequal,
 /// except numbers, which compare by value.
+#[expect(clippy::many_single_char_names, reason = "pairs of operands")]
 pub fn equals(a: &Value<'_>, b: &Value<'_>) -> bool {
     match (a, b) {
         (Value::Null, Value::Null) => true,
@@ -735,10 +741,6 @@ pub fn compare_numbers(a: &Value<'_>, b: &Value<'_>) -> Option<Ordering> {
     }
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "only used once the double is known to be beyond 2^64"
-)]
 fn compare_int_double(i: i128, d: f64) -> Option<Ordering> {
     if d.is_nan() {
         return None;

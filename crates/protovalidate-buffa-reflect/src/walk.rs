@@ -22,7 +22,7 @@ pub enum Abort {
 /// Where a value sits, as a chain of frames on the stack: the path is only
 /// written out when a violation is reported.
 struct Path<'p, 'a> {
-    parent: Option<&'p Path<'p, 'a>>,
+    parent: Option<&'p Self>,
     elem: &'a Elem,
     sub: Sub<'a>,
 }
@@ -34,6 +34,7 @@ enum Sub<'a> {
 }
 
 /// The rule a violation reports.
+#[derive(Clone, Copy)]
 enum RulePath<'a> {
     Elems(&'a [Elem]),
     Required,
@@ -208,9 +209,8 @@ impl<'a> Walker<'a> {
                     not,
                 } => {
                     let Value::Message(m) = v else { continue };
-                    let url = match m.field_by_name("type_url") {
-                        Some(Value::String(s)) => s,
-                        _ => continue,
+                    let Some(Value::String(url)) = m.field_by_name("type_url") else {
+                        continue;
                     };
                     let listed = urls.iter().any(|u| **u == *url);
                     if listed == *not {
@@ -371,7 +371,7 @@ fn rule_element(e: &Elem) -> FieldPathElement {
 
 fn is_zero(v: &Value<'_>) -> bool {
     match v {
-        Value::Null => true,
+        Value::Null | Value::Message(Msg::Default(..)) => true,
         Value::Bool(b) => !b,
         Value::Int(i) => *i == 0,
         Value::Uint(u) => *u == 0,
@@ -382,7 +382,6 @@ fn is_zero(v: &Value<'_>) -> bool {
         Value::Timestamp(t) => t.timestamp() == 0 && t.timestamp_subsec_nanos() == 0,
         Value::List(l) => l.len() == 0,
         Value::Map(m) => m.len() == 0,
-        Value::Message(Msg::Default(..)) => true,
         Value::Message(m) => m.descriptor().fields().iter().all(|fd| !m.has(fd)),
         Value::Type(_) => false,
     }

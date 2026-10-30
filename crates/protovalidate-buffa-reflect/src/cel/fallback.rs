@@ -32,7 +32,7 @@ use super::{
 };
 
 pub struct Program {
-    program: cel::Program,
+    compiled: cel::Program,
     /// Fields read through `has()`; see [`MsgVal`].
     has: HashSet<String>,
     consts: Vec<(&'static str, Const)>,
@@ -53,7 +53,7 @@ impl Program {
         let mut has = HashSet::new();
         presence_tested(program.expression(), &mut has);
         Ok(Self {
-            program,
+            compiled: program,
             has,
             consts: bindings.consts.to_vec(),
         })
@@ -77,7 +77,7 @@ impl Program {
         // and is dropped before `bind`.
         let resolver: &'static Bind<'static> = unsafe { std::mem::transmute(&bind) };
         cx.set_variable_resolver(resolver);
-        let result = self.program.execute(&cx);
+        let result = self.compiled.execute(&cx);
         drop(cx);
         match result {
             Ok(cel::Value::Bool(true)) => Ok(Outcome::Pass),
@@ -189,7 +189,9 @@ struct MsgVal<'a> {
     has: &'a HashSet<String>,
 }
 
-// SAFETY: as for `Bind`.
+// SAFETY: as for `Bind`: `Msg` may hold an `Rc`, which this value never
+// shares beyond the evaluation's thread.
+#[expect(clippy::non_send_fields_in_send_ty, reason = "see the safety note")]
 unsafe impl Send for MsgVal<'_> {}
 unsafe impl Sync for MsgVal<'_> {}
 
@@ -353,18 +355,22 @@ fn get_field<'b, 'v>(args: Vec<CowVal<'b, 'v>>) -> Result<CowVal<'b, 'v>, Execut
     Ok(CowVal::Owned(value))
 }
 
+/// A member function's name, overload id, receiver, arguments and body.
+type Overload = (
+    &'static str,
+    &'static str,
+    fn() -> Type,
+    Vec<Type>,
+    cel::common::functions::Function,
+);
+
 fn env() -> Env {
     use cel::common::types::{BOOL_TYPE, DOUBLE_TYPE, DYN_TYPE, INT_TYPE, LIST_TYPE, STRING_TYPE};
     let mut env = Env::stdlib();
     env.add_extension(cel::extensions::strings)
         .expect("the strings extension declares once");
-    let member: [(
-        &str,
-        &str,
-        fn() -> Type,
-        Vec<Type>,
-        cel::common::functions::Function,
-    ); 15] = [
+
+    let member: [Overload; 15] = [
         ("isEmail", "pv_is_email", || STRING_TYPE, vec![], is_email),
         (
             "isHostname",
