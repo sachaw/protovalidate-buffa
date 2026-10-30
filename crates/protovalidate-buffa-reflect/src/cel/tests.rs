@@ -10,7 +10,7 @@ use buffa_descriptor::{
         MessageOptions,
         field_descriptor_proto::{Label, Type},
     },
-    reflect::{DynamicMessage, MapKey, MapValue, ReflectMessage, ReflectMessageMut, Value as V},
+    reflect::{DynamicMessage, MapKey, MapValue, ReflectMessageMut, Value as V},
 };
 
 use super::{Bindings, Clock, Outcome, Program, Ty, fallback, value::Value};
@@ -120,7 +120,12 @@ fn both(source: &str) -> (String, String) {
         this: Ty::Message(idx),
         consts: &[],
     };
-    let this = Value::Message(super::value::Msg::Ref(&msg as &dyn ReflectMessage));
+    let bytes = msg.encode_to_vec();
+    let this = Value::Message(super::value::Msg::new(
+        crate::wire::Src::Bytes(&bytes),
+        idx,
+        &pool,
+    ));
     let clock = Clock::default();
     let compiled = match Program::compile(source, &bindings) {
         Ok(Some(p)) => {
@@ -252,7 +257,12 @@ fn the_interpreter_runs_what_the_tree_does_not() {
         this: Ty::Message(idx),
         consts: &[],
     };
-    let this = Value::Message(super::value::Msg::Ref(&msg as &dyn ReflectMessage));
+    let bytes = msg.encode_to_vec();
+    let this = Value::Message(super::value::Msg::new(
+        crate::wire::Src::Bytes(&bytes),
+        idx,
+        &pool,
+    ));
     let clock = Clock::default();
     for (source, want) in [
         ("this.?a.orValue(0) == 5", "pass"),

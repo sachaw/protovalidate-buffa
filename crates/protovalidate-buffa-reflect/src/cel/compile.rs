@@ -20,10 +20,10 @@ pub enum Node {
     This,
     Now,
     Local(u8),
-    /// A field of a message whose type is known, by index.
-    Field(Box<Self>, u32, Read),
-    /// `has()` of a field of a message whose type is known, by index.
-    Has(Box<Self>, u32),
+    /// A field of a message whose type is known.
+    Field(Box<Self>, Box<Read>),
+    /// `has()` of a field of a message whose type is known.
+    Has(Box<Self>, Box<Read>),
     /// A field, or a map entry, by name, resolved when it runs.
     Get(Box<Self>, Box<str>),
     HasName(Box<Self>, Box<str>),
@@ -282,12 +282,12 @@ impl Compiler<'_> {
                     return error(format!("undefined field '{field}' on {}", md.full_name()));
                 };
                 let fd = &md.fields()[index];
-                let index = u32::try_from(index).map_err(|_| Refusal::Unsupported)?;
+                let read = Box::new(Read::of(md, fd, self.pool));
                 Ok(if test {
-                    fold(Node::Has(Box::new(operand), index), Ty::Bool)
+                    fold(Node::Has(Box::new(operand), read), Ty::Bool)
                 } else {
                     fold(
-                        Node::Field(Box::new(operand), index, Read::of(fd, self.pool)),
+                        Node::Field(Box::new(operand), read),
                         Ty::of_field(fd, self.pool),
                     )
                 })
@@ -750,6 +750,43 @@ fn logic(and: bool, a: Node, b: Node) -> Node {
         (Node::Const(Const::Bool(_)), n) | (n, Node::Const(Const::Bool(_))) => n,
         pair if and => Node::And(Box::new(pair.into())),
         pair => Node::Or(Box::new(pair.into())),
+    }
+}
+
+impl Node {
+    /// Calls `f` with the number of each field of `this` the node reads.
+    pub fn reads(&self, f: &mut dyn FnMut(u32)) {
+        match self {
+            Self::Field(x, read) | Self::Has(x, read) if matches!(**x, Self::This) => {
+                f(read.shape.number);
+            }
+            Self::Const(_) | Self::This | Self::Now | Self::CompareThis(..) | Self::Local(_) => {}
+            Self::Field(x, _)
+            | Self::Has(x, _)
+            | Self::Get(x, _)
+            | Self::HasName(x, _)
+            | Self::Not(x)
+            | Self::Neg(x)
+            | Self::Call1(_, x)
+            | Self::Match(x, _)
+            | Self::Size(x, _) => x.reads(f),
+            Self::And(xs) | Self::Or(xs) | Self::Op(_, xs) => xs.iter().for_each(|x| x.reads(f)),
+            Self::Cond(xs) => xs.iter().for_each(|x| x.reads(f)),
+            Self::List(xs) | Self::Call(_, xs) => xs.iter().for_each(|x| x.reads(f)),
+            Self::Map(es) => es.iter().for_each(|(k, v)| {
+                k.reads(f);
+                v.reads(f);
+            }),
+            Self::Compare(_, x) => x.0.reads(f),
+            Self::Choose(x) => x.0.reads(f),
+            Self::Fold(fold) => {
+                fold.range.reads(f);
+                fold.test
+                    .iter()
+                    .chain(&fold.transform)
+                    .for_each(|x| x.reads(f));
+            }
+        }
     }
 }
 

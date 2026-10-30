@@ -139,6 +139,16 @@ impl Program {
         outcome(result)
     }
 
+    /// Calls `f` with the number of each field of `this` the expression
+    /// reads directly; the interpreter's reads are not known.
+    pub fn reads(&self, f: &mut dyn FnMut(u32)) {
+        match &self.0 {
+            Kind::Check(check) => check.pred.reads(f),
+            Kind::Native(node, _) => node.reads(f),
+            Kind::Fallback(_) => {}
+        }
+    }
+
     /// Whether this expression runs on the interpreter.
     #[cfg(test)]
     pub const fn is_fallback(&self) -> bool {

@@ -108,10 +108,7 @@ pub fn arithmetic<'a>(op: Op, a: &Value<'a>, b: &Value<'a>) -> Result<Value<'a>,
             Ok(Value::Bytes(Bin::Rc([&**x, &**y].concat().into())))
         }
         (Value::List(x), Value::List(y)) if op == Op::Add => {
-            let items: Vec<_> = (0..x.len())
-                .filter_map(|i| x.get(i))
-                .chain((0..y.len()).filter_map(|i| y.get(i)))
-                .collect();
+            let items: Vec<_> = x.items().into_iter().chain(y.items()).collect();
             Ok(Value::List(List::Owned(items.into())))
         }
         (Value::Duration(x), Value::Duration(y)) if matches!(op, Op::Add | Op::Sub) => {
@@ -385,12 +382,12 @@ pub fn call<'a>(func: &Func, args: &[Value<'a>]) -> Result<Value<'a>, Error> {
                 None => "",
             };
             let mut out = String::new();
-            for i in 0..list.len() {
+            for (i, item) in list.items().iter().enumerate() {
                 if i > 0 {
                     out.push_str(sep);
                 }
-                match list.get(i) {
-                    Some(Value::String(s)) => out.push_str(&s),
+                match item {
+                    Value::String(s) => out.push_str(s),
                     _ => return Err(Error::new("join requires a list of strings")),
                 }
             }
@@ -439,28 +436,30 @@ fn host_and_port(s: &str, port_required: bool) -> bool {
 }
 
 fn unique(v: &Value<'_>) -> Result<bool, Error> {
+    const SMALL: usize = 16;
     let Value::List(list) = v else {
         return Err(overload("unique", std::slice::from_ref(v)));
     };
-    let n = list.len();
-    if n <= 1 {
-        return Ok(true);
-    }
     // Small lists compare pairwise rather than build a set.
-    if n <= 16 {
-        for i in 0..n {
-            let a = list.get(i).unwrap_or(Value::Null);
-            for j in (i + 1)..n {
-                if equals(&a, &list.get(j).unwrap_or(Value::Null)) {
-                    return Ok(false);
-                }
-            }
+    let mut small = [const { Value::Null }; SMALL];
+    let mut n = 0;
+    list.for_each(&mut |item| {
+        if n < SMALL {
+            small[n] = item;
         }
-        return Ok(true);
+        n += 1;
+        n <= SMALL
+    });
+    if n <= SMALL {
+        let items = &small[..n];
+        return Ok(items
+            .iter()
+            .enumerate()
+            .all(|(i, a)| !items[i + 1..].iter().any(|b| equals(a, b))));
     }
     let mut seen = HashSet::with_capacity(n);
-    for i in 0..n {
-        let key = match list.get(i).unwrap_or(Value::Null) {
+    for item in list.items() {
+        let key = match item {
             Value::Bool(b) => Key::Bool(b),
             Value::Int(i) => Key::Int(i128::from(i)),
             Value::Uint(u) => Key::Int(i128::from(u)),

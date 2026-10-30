@@ -2,6 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use buffa::Message;
 use buffa_descriptor::{
     DescriptorPool, MessageIndex,
     reflect::{DynamicMessage, ReflectMessage},
@@ -24,7 +25,7 @@ impl Validator {
     /// # Errors
     ///
     /// The request is invalid, or its rules cannot be evaluated.
-    pub fn check(&self, request: &dyn ReflectMessage) -> Result<(), ConnectError> {
+    pub fn check<M: Message + ReflectMessage>(&self, request: &M) -> Result<(), ConnectError> {
         self.validate(request)
             .map_err(protovalidate_buffa::ValidationError::into_connect_error)
     }
@@ -33,10 +34,13 @@ impl Validator {
 /// A Connect interceptor that validates every request message of the
 /// services a descriptor pool describes, before the handler runs.
 ///
-/// The interceptor sees the request before it is decoded, as bytes, so it
-/// decodes a [`DynamicMessage`] from the method's input descriptor to
-/// validate. Requests to methods the pool does not describe, and bodies
-/// that do not decode, pass through to the handler, which reports them.
+/// The interceptor sees the request before it is decoded, as bytes, and
+/// validates the bytes without decoding them, so an invalid request is
+/// rejected before the handler decodes it. A JSON request is decoded as a
+/// [`DynamicMessage`] from the method's input descriptor and validated
+/// through its encoding. Requests to methods the pool does not describe,
+/// and bodies that do not decode, pass through to the handler, which
+/// reports them.
 ///
 /// ```ignore
 /// let pool = Arc::clone(my_api::__buffa::reflect::descriptor_pool());
@@ -91,20 +95,22 @@ impl Inner {
         let Ok(bytes) = payload.encoded() else {
             return Ok(());
         };
-        let message = match payload.format() {
-            CodecFormat::Proto => DynamicMessage::decode_with_options(
-                Arc::clone(&self.pool),
-                input,
-                &bytes,
-                payload.decode_options(),
-            )
-            .ok(),
-            CodecFormat::Json => std::str::from_utf8(&bytes).ok().and_then(|json| {
+        let result = match payload.format() {
+            CodecFormat::Proto => self.validator.validate_wire(&self.pool, input, &bytes),
+            CodecFormat::Json => match std::str::from_utf8(&bytes).ok().and_then(|json| {
                 DynamicMessage::from_json(Arc::clone(&self.pool), input, json).ok()
-            }),
-            _ => None,
+            }) {
+                Some(message) => {
+                    self.validator
+                        .validate_wire(&self.pool, input, &message.encode_to_vec())
+                }
+                None => return Ok(()),
+            },
+            _ => return Ok(()),
         };
-        message.map_or(Ok(()), |message| self.validator.check(&message))
+        result
+            .unwrap_or(Ok(()))
+            .map_err(protovalidate_buffa::ValidationError::into_connect_error)
     }
 }
 

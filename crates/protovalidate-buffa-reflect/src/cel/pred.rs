@@ -5,8 +5,6 @@
 //! The predicate is derived from the folded expression, so it means exactly
 //! what the rule's CEL means; any shape not listed here stays a [`Node`].
 
-use std::borrow::Cow;
-
 use regex::Regex;
 
 use super::{
@@ -26,8 +24,8 @@ pub enum Pred {
     Match(Operand, Box<Regex>),
     /// `x in [..]`.
     In(Operand, Box<[Const]>),
-    /// `has(x.f)`, by field index.
-    Has(Operand, u32),
+    /// `has(x.f)`.
+    Has(Operand, Box<Read>),
     /// A test of a string `x`, such as `x.isEmail()`.
     Text(Operand, fn(&str) -> bool),
     /// A test of a double `x`, such as `x.isNan()`.
@@ -40,7 +38,7 @@ pub enum Pred {
 }
 
 /// `this`, or a path of fields from it.
-pub struct Operand(Box<[(u32, Read)]>);
+pub struct Operand(Box<[Read]>);
 
 /// A rule as a native check: it fails when `pred` is `fails_when`, with the
 /// given message, if any.
@@ -82,8 +80,8 @@ impl Operand {
         loop {
             match at {
                 Node::This => break,
-                Node::Field(x, i, read) => {
-                    path.push((*i, *read));
+                Node::Field(x, read) => {
+                    path.push((**read).clone());
                     at = x;
                 }
                 _ => return None,
@@ -93,22 +91,34 @@ impl Operand {
         Some(Self(path.into()))
     }
 
-    #[inline]
-    fn get<'v, 'a>(&self, this: &'v Value<'a>) -> Result<Cow<'v, Value<'a>>, Error> {
-        let Some(((first, read), rest)) = self.0.split_first() else {
-            return Ok(Cow::Borrowed(this));
-        };
-        let mut v = field(this, *first, *read)?;
-        for (i, read) in rest {
-            v = field(&v, *i, *read)?;
+    fn reads(&self, f: &mut dyn FnMut(u32)) {
+        if let Some(first) = self.0.first() {
+            f(first.shape.number);
         }
-        Ok(Cow::Owned(v))
+    }
+
+    /// Calls `f` with the operand's value. `this` itself is passed as is,
+    /// not moved through a return value.
+    #[inline]
+    fn with<'a, R>(
+        &'a self,
+        this: &Value<'a>,
+        f: impl FnOnce(&Value<'a>) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let Some((first, rest)) = self.0.split_first() else {
+            return f(this);
+        };
+        let mut v = field(this, first)?;
+        for read in rest {
+            v = field(&v, read)?;
+        }
+        f(&v)
     }
 }
 
-fn field<'a>(v: &Value<'a>, i: u32, read: Read) -> Result<Value<'a>, Error> {
+fn field<'a>(v: &Value<'a>, read: &'a Read) -> Result<Value<'a>, Error> {
     match v {
-        Value::Message(m) => Ok(m.read(i as usize, read, None)),
+        Value::Message(m) => Ok(m.read(read)),
         other => Err(Error::new(format!(
             "type '{}' does not support field selection",
             other.type_of().name()
@@ -150,7 +160,7 @@ impl Pred {
                 }
                 _ => return None,
             },
-            Node::Has(x, i) => Self::Has(Operand::from_node(x)?, *i),
+            Node::Has(x, read) => Self::Has(Operand::from_node(x)?, read.clone()),
             Node::Call1(f, s) if pure(f) => {
                 let x = Operand::from_node(s)?;
                 match (text(f), number(f)) {
@@ -176,15 +186,43 @@ impl Pred {
         })
     }
 
-    pub fn eval(&self, this: &Value<'_>) -> Result<bool, Error> {
+    /// Calls `f` with the number of each field of `this` the predicate reads.
+    pub fn reads(&self, f: &mut dyn FnMut(u32)) {
         match self {
-            Self::Compare(x, op, c) => eval::compare_const_bool(*op, &*x.get(this)?, c),
-            Self::Compare2(x, op, y) => match eval::binary(*op, &*x.get(this)?, &*y.get(this)?)? {
-                Value::Bool(b) => Ok(b),
-                _ => unreachable!("comparisons are bools"),
+            Self::Compare(x, ..)
+            | Self::Size(x, ..)
+            | Self::Match(x, _)
+            | Self::In(x, _)
+            | Self::Text(x, _)
+            | Self::Number(x, _)
+            | Self::Call(_, x, _) => x.reads(f),
+            Self::Compare2(x, _, y) => {
+                x.reads(f);
+                y.reads(f);
+            }
+            Self::Has(x, read) => match x.0.first() {
+                Some(first) => f(first.shape.number),
+                None => f(read.shape.number),
             },
-            Self::Size(x, op, c) => {
-                let n = match &*x.get(this)? {
+            Self::Not(p) => p.reads(f),
+            Self::And(ps) | Self::Or(ps) => {
+                ps.0.reads(f);
+                ps.1.reads(f);
+            }
+        }
+    }
+
+    pub fn eval<'a>(&'a self, this: &Value<'a>) -> Result<bool, Error> {
+        match self {
+            Self::Compare(x, op, c) => x.with(this, |v| eval::compare_const_bool(*op, v, c)),
+            Self::Compare2(x, op, y) => x.with(this, |a| {
+                y.with(this, |b| match eval::binary(*op, a, b)? {
+                    Value::Bool(b) => Ok(b),
+                    _ => unreachable!("comparisons are bools"),
+                })
+            }),
+            Self::Size(x, op, c) => x.with(this, |v| {
+                let n = match v {
                     Value::String(s) => eval::char_count(s),
                     other => match functions::call(&Func::Size, std::slice::from_ref(other))? {
                         Value::Int(n) => n,
@@ -198,33 +236,32 @@ impl Pred {
                     _ => Value::Int(n),
                 };
                 eval::compare_const_bool(*op, &n, c)
-            }
-            Self::Match(x, re) => match &*x.get(this)? {
+            }),
+            Self::Match(x, re) => x.with(this, |v| match v {
                 Value::String(s) => Ok(re.is_match(s)),
                 other => Err(Error::no_overload("matches", &[other.type_of()])),
-            },
-            Self::In(x, items) => {
-                let v = x.get(this)?;
-                Ok(items.iter().any(|c| equals(&v, &Value::from_const(c))))
-            }
-            Self::Has(x, i) => match &*x.get(this)? {
-                Value::Message(m) => Ok(m.has(&m.descriptor().fields()[*i as usize])),
+            }),
+            Self::In(x, items) => x.with(this, |v| {
+                Ok(items.iter().any(|c| equals(v, &Value::from_const(c))))
+            }),
+            Self::Has(x, read) => x.with(this, |v| match v {
+                Value::Message(m) => Ok(m.has_read(read)),
                 other => Err(Error::new(format!(
                     "type '{}' does not support field selection",
                     other.type_of().name()
                 ))),
-            },
-            Self::Text(x, test) => match &*x.get(this)? {
+            }),
+            Self::Text(x, test) => x.with(this, |v| match v {
                 Value::String(s) => Ok(test(s)),
                 other => Err(Error::no_overload("string function", &[other.type_of()])),
-            },
-            Self::Number(x, test) => match &*x.get(this)? {
+            }),
+            Self::Number(x, test) => x.with(this, |v| match v {
                 Value::Double(d) => Ok(test(*d)),
                 other => Err(Error::no_overload("double function", &[other.type_of()])),
-            },
+            }),
             Self::Call(f, x, consts) => {
                 let mut args = [const { Value::Null }; 4];
-                args[0] = x.get(this)?.into_owned();
+                args[0] = x.with(this, |v| Ok(v.clone()))?;
                 for (slot, c) in args[1..].iter_mut().zip(consts.iter()) {
                     *slot = Value::from_const(c);
                 }
@@ -245,7 +282,7 @@ impl Pred {
 
 /// `&&` (deciding on false) and `||` (deciding on true): a deciding side
 /// absorbs the other's error, as CEL specifies.
-fn logic(decides: bool, a: &Pred, b: &Pred, this: &Value<'_>) -> Result<bool, Error> {
+fn logic<'a>(decides: bool, a: &'a Pred, b: &'a Pred, this: &Value<'a>) -> Result<bool, Error> {
     let first = a.eval(this);
     if first == Ok(decides) {
         return Ok(decides);

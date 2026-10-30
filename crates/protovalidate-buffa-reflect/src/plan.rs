@@ -22,9 +22,12 @@ use buffa_descriptor::{
 };
 use protovalidate_buffa::FieldType;
 
-use crate::cel::{
-    Bindings, Program, Ty,
-    value::{self, Const, Wkt},
+use crate::{
+    cel::{
+        Bindings, Program, Ty,
+        value::{self, Const, ConstMsg, Msg, Read, Wkt},
+    },
+    wire::Src,
 };
 
 /// A path element, kept in a plan and written out only for a violation.
@@ -42,8 +45,9 @@ pub struct Elem {
 /// Every message plan reached from one root type.
 pub struct Plans {
     pub messages: Vec<MessagePlan>,
-    // Keeps the descriptors the plans index into alive.
-    pub _pool: Arc<DescriptorPool>,
+    pub root: MessageIndex,
+    /// The pool the plans index into, which this keeps alive.
+    pub pool: Arc<DescriptorPool>,
 }
 
 #[derive(Default)]
@@ -51,20 +55,31 @@ pub struct MessagePlan {
     pub error: Option<String>,
     pub rules: Vec<Rule>,
     pub message_oneofs: Vec<MessageOneof>,
-    /// Oneofs that require a member: the oneof's index and name.
-    pub oneofs: Vec<(usize, Box<str>)>,
+    /// Oneofs that require a member: their members, by slot, and name.
+    pub oneofs: Vec<(Box<[usize]>, Box<str>)>,
     pub fields: Vec<FieldPlan>,
+    /// The fields a walk reads, each in a slot.
+    pub slots: Vec<Slot>,
+    pub dispatch: Dispatch,
+}
+
+/// A field a walk reads: how, and the slots of the other members of its
+/// oneof, which setting it clears.
+pub struct Slot {
+    pub read: value::Read,
+    pub siblings: Box<[usize]>,
 }
 
 pub struct MessageOneof {
+    /// The fields, by index while planning and by slot once laid out.
     pub fields: Box<[usize]>,
     pub names: Box<str>,
     pub required: bool,
 }
 
 pub struct FieldPlan {
-    pub index: usize,
-    pub read: value::Read,
+    /// The field's index while planning, and its slot once laid out.
+    pub slot: usize,
     pub elem: Elem,
     pub required: bool,
     /// Unset fields are skipped: the field tracks presence, or the rules
@@ -298,9 +313,15 @@ impl<'p> Builder<'p> {
     pub fn build(mut self, root: MessageIndex) -> Plans {
         self.message(root);
         prune(&mut self.plans);
+        let mut types: Vec<_> = self.index.iter().map(|(&m, &i)| (i, m)).collect();
+        types.sort_unstable_by_key(|&(i, _)| i);
+        for (i, m) in types {
+            layout(&mut self.plans[i], self.pool.message(m), self.pool);
+        }
         Plans {
             messages: self.plans,
-            _pool: Arc::clone(self.pool),
+            root,
+            pool: Arc::clone(self.pool),
         }
     }
 
@@ -366,7 +387,7 @@ impl<'p> Builder<'p> {
             }
         }
 
-        for (i, o) in md.oneofs().iter().enumerate() {
+        for o in md.oneofs() {
             let required = oneof_ext
                 .and_then(|ext| {
                     o.options()
@@ -374,7 +395,8 @@ impl<'p> Builder<'p> {
                 })
                 .is_some_and(|r| get_bool(&r, "required"));
             if required && !o.is_synthetic() {
-                plan.oneofs.push((i, o.name().into()));
+                let members = o.field_indices().iter().map(|&f| usize::from(f)).collect();
+                plan.oneofs.push((members, o.name().into()));
             }
         }
 
@@ -413,8 +435,7 @@ impl<'p> Builder<'p> {
             Err(e) => (ValuePlan::default(), Some(e)),
         };
         Some(FieldPlan {
-            index,
-            read: value::Read::of(fd, self.pool),
+            slot: index,
             elem: elem(fd, None),
             required: rules.is_some_and(|r| get_bool(r, "required")),
             skip_unset: presence || ignore == IGNORE_IF_ZERO_VALUE,
@@ -638,10 +659,17 @@ impl<'p> Builder<'p> {
         let type_elem = elem(type_fd, None);
         let rules_md = type_rules.message_descriptor();
         let rules_idx = pool.message_index(rules_md.full_name());
-        let rules_const = Const::Message(Arc::new(type_rules.clone()));
-
+        let Some(rules_index) = rules_idx else {
+            return Err(format!("{} is not in the pool", rules_md.full_name()));
+        };
+        let rules_msg = ConstMsg {
+            bytes: type_rules.encode_to_vec().into(),
+            index: rules_index,
+            pool: Arc::clone(pool),
+        };
+        let rules = Msg::new(Src::Bytes(&rules_msg.bytes), rules_index, pool);
         let mut set: Vec<(FieldDescriptor, Elem, Const)> = Vec::new();
-        type_rules.for_each_set(&mut |rule_fd, v| {
+        type_rules.for_each_set(&mut |rule_fd, _| {
             let declared = rules_md.field(rule_fd.number()).is_some();
             let name = if declared {
                 None
@@ -653,9 +681,10 @@ impl<'p> Builder<'p> {
             set.push((
                 rule_fd.clone(),
                 elem(rule_fd, name),
-                value::from_field(v, rule_fd).to_const(),
+                read_const(&rules, rules_md, rule_fd, pool),
             ));
         });
+        let rules_const = Const::Message(Arc::new(rules_msg));
         // Declared rules first, in field order; then extensions by number.
         set.sort_by_key(|(f, e, _)| {
             (
@@ -906,6 +935,133 @@ fn prune_value(v: &mut ValuePlan, live: &[bool]) {
         prune_value(&mut entries.1, live);
         if entries.0.is_empty() && entries.1.is_empty() {
             v.entries = None;
+        }
+    }
+}
+
+/// A rule's value, read from the encoded rules.
+fn read_const(
+    rules: &Msg<'_>,
+    md: &MessageDescriptor,
+    fd: &FieldDescriptor,
+    pool: &DescriptorPool,
+) -> Const {
+    let read = Read::of(md, fd, pool);
+    rules.read(&read).to_const()
+}
+
+/// Gives each field a walk reads a slot, and a dispatch from field numbers
+/// to slots.
+fn layout(plan: &mut MessagePlan, md: &MessageDescriptor, pool: &DescriptorPool) {
+    let mut by_field: Vec<Option<usize>> = vec![None; md.fields().len()];
+    let mut order: Vec<usize> = Vec::new();
+    let mut slot = |f: usize, by_field: &mut Vec<Option<usize>>| -> usize {
+        if let Some(s) = by_field[f] {
+            return s;
+        }
+        // Setting a oneof member clears the others, so a slot for one is a
+        // slot for all.
+        let members: Vec<usize> = match md.fields()[f].oneof_index() {
+            Some(o) => md.oneofs()[usize::from(o)]
+                .field_indices()
+                .iter()
+                .map(|&i| usize::from(i))
+                .collect(),
+            None => vec![f],
+        };
+        for m in members {
+            if by_field[m].is_none() {
+                by_field[m] = Some(order.len());
+                order.push(m);
+            }
+        }
+        by_field[f].expect("just given a slot")
+    };
+    for field in &mut plan.fields {
+        field.slot = slot(field.slot, &mut by_field);
+    }
+    let mut read = Vec::new();
+    for rule in &plan.rules {
+        rule.program.reads(&mut |n| read.push(n));
+    }
+    for n in read {
+        if let Some(f) = md.fields().iter().position(|f| f.number() == n) {
+            slot(f, &mut by_field);
+        }
+    }
+    for o in &mut plan.message_oneofs {
+        o.fields = o.fields.iter().map(|&f| slot(f, &mut by_field)).collect();
+    }
+    for (members, _) in &mut plan.oneofs {
+        *members = members.iter().map(|&f| slot(f, &mut by_field)).collect();
+    }
+    plan.slots = order
+        .iter()
+        .map(|&f| {
+            let fd = &md.fields()[f];
+            let siblings = match fd.oneof_index() {
+                Some(o) => md.oneofs()[usize::from(o)]
+                    .field_indices()
+                    .iter()
+                    .map(|&i| usize::from(i))
+                    .filter(|&i| i != f)
+                    .filter_map(|i| by_field[i])
+                    .collect(),
+                None => Box::default(),
+            };
+            Slot {
+                read: Read::of(md, fd, pool),
+                siblings,
+            }
+        })
+        .collect();
+    plan.dispatch = Dispatch::new(order.iter().map(|&f| md.fields()[f].number()));
+}
+
+/// Field numbers to slots.
+#[derive(Default)]
+pub enum Dispatch {
+    /// Indexed by field number: the slot plus one, or zero.
+    Dense(Box<[u16]>),
+    /// Sorted by field number.
+    Sparse(Box<[(u32, u16)]>),
+    #[default]
+    None,
+}
+
+impl Dispatch {
+    fn new(numbers: impl Iterator<Item = u32>) -> Self {
+        let mut pairs: Vec<(u32, u16)> = numbers
+            .enumerate()
+            .map(|(s, n)| (n, u16::try_from(s).unwrap_or(u16::MAX)))
+            .collect();
+        let Some(max) = pairs.iter().map(|p| p.0).max() else {
+            return Self::None;
+        };
+        if max as usize <= 64 + 4 * pairs.len() {
+            let mut dense = vec![0u16; max as usize + 1];
+            for (n, s) in pairs {
+                dense[n as usize] = s + 1;
+            }
+            Self::Dense(dense.into())
+        } else {
+            pairs.sort_unstable();
+            Self::Sparse(pairs.into())
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, number: u32) -> Option<usize> {
+        match self {
+            Self::Dense(d) => match d.get(number as usize) {
+                Some(&s) if s > 0 => Some(usize::from(s - 1)),
+                _ => None,
+            },
+            Self::Sparse(p) => p
+                .binary_search_by_key(&number, |&(n, _)| n)
+                .ok()
+                .map(|i| usize::from(p[i].1)),
+            Self::None => None,
         }
     }
 }

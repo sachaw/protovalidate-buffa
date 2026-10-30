@@ -86,12 +86,8 @@ fn eval<'a>(node: &'a Node, f: &mut Frame<'a, '_, '_>) -> Result<Value<'a>, Erro
                 .now(),
         ),
         Node::Local(s) => f.locals[usize::from(*s)].clone(),
-        Node::Field(x, i, read) => message(&*operand(x, f)?)?.read(*i as usize, *read, None),
-        Node::Has(x, i) => {
-            let v = eval(x, f)?;
-            let m = message(&v)?;
-            Value::Bool(m.has(&m.descriptor().fields()[*i as usize]))
-        }
+        Node::Field(x, read) => message(&*operand(x, f)?)?.read(read),
+        Node::Has(x, read) => Value::Bool(message(&eval(x, f)?)?.has_read(read)),
         Node::Get(x, name) => select(&eval(x, f)?, name)?,
         Node::HasName(x, name) => match eval(x, f)? {
             Value::Message(m) => Value::Bool(
@@ -421,11 +417,7 @@ fn index<'a>(container: &Value<'a>, key: &Value<'a>) -> Result<Value<'a>, Error>
 fn each<'a>(range: &Value<'a>, f: &mut dyn FnMut(Value<'a>) -> bool) -> Result<(), Error> {
     match range {
         Value::List(l) => {
-            for i in 0..l.len() {
-                if !f(l.get(i).unwrap_or(Value::Null)) {
-                    break;
-                }
-            }
+            l.for_each(f);
             Ok(())
         }
         Value::Map(m) => {

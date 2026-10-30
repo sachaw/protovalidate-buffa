@@ -1,6 +1,6 @@
-//! Executor for the upstream `protovalidate-conformance` harness, validating
-//! through reflection: each case is decoded as a [`DynamicMessage`] against
-//! the descriptors the harness sends, as protovalidate-go's executor does.
+//! Executor for the upstream `protovalidate-conformance` harness: each case's
+//! encoding is validated against the descriptors the harness sends, without
+//! decoding it.
 //!
 //! Protocol: a `TestConformanceRequest` on stdin, a `TestConformanceResponse`
 //! on stdout.
@@ -106,22 +106,14 @@ fn run(
             .expect("TestResult declares every outcome");
         result.set(fd, value);
     };
-    let Some(message) = DynamicMessage::new_by_name(Arc::clone(cases), name) else {
+    let Some(index) = cases.message_index(name) else {
         set(
             "unexpected_error",
             Value::String(format!("unknown message type {name}")),
         );
         return Ok(result);
     };
-    let mut message = message;
-    if let Err(e) = message.merge(bytes) {
-        set(
-            "unexpected_error",
-            Value::String(format!("decoding {name}: {e}")),
-        );
-        return Ok(result);
-    }
-    match validator.validate(&message) {
+    match validator.validate_encoded(cases, index, bytes) {
         Ok(()) => set("success", Value::Bool(true)),
         Err(e) if e.compile_error.is_some() => {
             set(

@@ -158,13 +158,11 @@ pub fn to_text(v: &Value<'_>) -> Result<String, Error> {
         Value::Type(t) => t.name().into(),
         Value::List(l) => {
             let mut out = String::from("[");
-            for i in 0..l.len() {
+            for (i, item) in l.items().iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                if let Some(item) = l.get(i) {
-                    out.push_str(&to_text(&item)?);
-                }
+                out.push_str(&to_text(item)?);
             }
             out.push(']');
             out

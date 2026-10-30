@@ -1,6 +1,7 @@
-//! The reflection validator and the plugin's generated validators report the
-//! same violations, on the same messages, valid and not; and validating a
-//! generated type agrees with validating the same message decoded dynamically.
+//! The descriptor-driven validator and the plugin's generated validators
+//! report the same violations, on the same messages, valid and not; and
+//! validating an encoding agrees with decoding it and validating the decoded
+//! message, however the encoding is written.
 
 use std::sync::Arc;
 
@@ -43,10 +44,26 @@ where
     let typed = M::decode_from_slice(&dynamic.encode_to_vec()).expect("decodes");
     let validator = Validator::new();
     let generated = summary(typed.validate());
-    let reflected = summary(validator.validate(&typed));
-    let dynamic = summary(validator.validate(&dynamic));
-    assert_eq!(reflected, generated, "{json}");
-    assert_eq!(dynamic, reflected, "{json}");
+    let typed = summary(validator.validate(&typed));
+    let encoded = summary(validator.validate_encoded(pool, idx, &dynamic.encode_to_vec()));
+    assert_eq!(typed, generated, "{json}");
+    assert_eq!(encoded, generated, "{json}");
+}
+
+/// Validating `bytes` agrees with decoding them and validating the decoded
+/// message.
+fn agree_encoded<M>(bytes: &[u8])
+where
+    M: Message + ReflectMessage + Validate + Default,
+{
+    let pool = c::__buffa::reflect::descriptor_pool();
+    let idx = pool
+        .message_index(M::default().message_descriptor().full_name())
+        .expect("a case type");
+    let decoded = M::decode_from_slice(bytes).expect("decodes");
+    let generated = summary(decoded.validate());
+    let encoded = summary(Validator::new().validate_encoded(pool, idx, bytes));
+    assert_eq!(encoded, generated, "{bytes:02x?}");
 }
 
 const COMPLEX: &[(&str, &str)] = &[
@@ -170,4 +187,52 @@ fn repeated_and_maps() {
     agree::<c::MapValues>(r#"{"val": {"a": "ab", "b": "abcd"}}"#);
     agree::<c::MapKeys>(r#"{"val": {"1": "a", "-1": "b"}}"#);
     agree::<c::MapKeysPattern>(r#"{"val": {"a!": "x", "ok": "y"}}"#);
+}
+
+/// Encodings a decoder reads differently from how they are written: fields
+/// repeated, out of order, split, cleared by a oneof sibling, or unknown.
+#[test]
+fn encodings() {
+    // StringLen: val (1) has len == 3.
+    agree_encoded::<c::StringLen>(b"\x0a\x01a\x0a\x03abc");
+    agree_encoded::<c::StringLen>(b"\x0a\x03abc\x0a\x01a");
+    // Unknown fields are skipped.
+    agree_encoded::<c::StringLen>(b"\x10\x05\x0a\x03abc\x78\x01");
+    // RepeatedMin: val (1), repeated Embed { val (1) > 0 }, min_items 2.
+    agree_encoded::<c::RepeatedMin>(b"\x0a\x02\x08\x01\x12\x00\x0a\x02\x08\x7f");
+    agree_encoded::<c::RepeatedMin>(b"\x0a\x00\x0a\x02\x08\x01");
+    // RepeatedUnique, written twice over.
+    agree_encoded::<c::RepeatedUnique>(b"\x0a\x01a\x0a\x01b\x0a\x01a");
+    // MapKeys: map<sint64, string> keys < 0; a repeated key keeps the last.
+    agree_encoded::<c::MapKeys>(b"\x0a\x05\x08\x01\x12\x01a\x0a\x05\x08\x01\x12\x01b");
+    agree_encoded::<c::MapKeys>(b"\x0a\x05\x08\x01\x12\x01a");
+    agree_encoded::<c::MapKeys>(b"\x0a\x00");
+    agree_encoded::<c::MapKeysPattern>(
+        b"\x0a\x07\x0a\x02a!\x12\x01x\x0a\x07\x0a\x02a!\x12\x01y\x0a\x07\x0a\x02ok\x12\x01y",
+    );
+    // MessageExpressions: e (5) split over two occurrences merges into
+    // {a: 1, b: 2}, which fails `a > b`; f (6) is written whole.
+    agree_encoded::<cr::MessageExpressions>(
+        b"\x08\x01\x10\x02\x2a\x02\x08\x01\x2a\x02\x10\x02\x32\x04\x08\x03\x10\x01",
+    );
+    agree_encoded::<cr::MessageExpressions>(
+        b"\x08\x01\x10\x02\x2a\x02\x10\x02\x2a\x02\x08\x03\x32\x04\x08\x03\x10\x01",
+    );
+    // An implicit-presence field written as zero is unset.
+    agree_encoded::<cr::MessageExpressions>(b"\x08\x00\x10\x01");
+    // KitchenSink's oneof o (x = 16, y = 17) is required: the last member
+    // written is the one set.
+    let complex = |tail: &[u8]| {
+        let mut m = b"\x0a\x04abcd\x18\x05\x32\x02\x08\x03".to_vec();
+        m.extend_from_slice(tail);
+        let mut out = vec![0x0a];
+        out.push(u8::try_from(m.len()).expect("short"));
+        out.extend(m);
+        out
+    };
+    agree_encoded::<c::KitchenSinkMessage>(&complex(b"\x82\x01\x01x\x88\x01\x01"));
+    agree_encoded::<c::KitchenSinkMessage>(&complex(b"\x88\x01\x01\x82\x01\x01x"));
+    agree_encoded::<c::KitchenSinkMessage>(&complex(b""));
+    // dur_val (6) written twice: the second, 20s, breaks `lt: 17s`.
+    agree_encoded::<c::KitchenSinkMessage>(&complex(b"\x32\x02\x08\x14\x82\x01\x01x"));
 }

@@ -1,6 +1,6 @@
-//! CEL values over reflected messages.
+//! CEL values over encoded messages.
 //!
-//! A [`Value`] borrows from the message being validated, or from a rule's
+//! A [`Value`] borrows from the encoding being validated, or from a rule's
 //! constants, so reading a field, a string or a list costs no allocation.
 //! Values an expression builds (concatenations, `map()` results) are
 //! reference counted.
@@ -8,15 +8,16 @@
 use std::{cmp::Ordering, fmt, rc::Rc, sync::Arc};
 
 use buffa_descriptor::{
-    DescriptorPool, FieldDescriptor, FieldKind, MessageDescriptor, ScalarType, SingularKind,
-    reflect::{
-        DynamicMessage, MapKey, MapKeyRef, ReflectCow, ReflectList, ReflectMap, ReflectMessage,
-        ValueRef,
-    },
+    DescriptorPool, FieldDescriptor, MessageDescriptor, MessageIndex, ScalarType,
+    reflect::DynamicMessage,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 
 use super::Error;
+use crate::{
+    plan::Dispatch,
+    wire::{self, Card, Found, Kind, Raw, Shape, Src},
+};
 
 /// A CEL value.
 #[derive(Clone)]
@@ -50,20 +51,27 @@ pub enum Bin<'a> {
     Rc(Rc<[u8]>),
 }
 
-/// A message.
+/// A message: its encoding and its type.
 #[derive(Clone)]
-pub enum Msg<'a> {
-    Ref(&'a dyn ReflectMessage),
-    /// An unset message field, read as its default without building one.
-    Default(&'a MessageDescriptor, &'a Arc<DescriptorPool>),
-    /// A snapshot from a bridge-mode type, which reflection hands out owned.
-    Owned(Rc<DynamicMessage>),
+pub struct Msg<'a> {
+    pub src: Src<'a>,
+    pub index: MessageIndex,
+    pub pool: &'a Arc<DescriptorPool>,
+    /// Fields already found in the encoding, read without another pass.
+    pub gathered: Option<&'a Gathered<'a>>,
+}
+
+/// The fields a walk found in one pass over a message, by slot.
+pub struct Gathered<'a> {
+    pub dispatch: &'a Dispatch,
+    pub found: &'a [Found<'a>],
 }
 
 /// A list.
 #[derive(Clone)]
 pub enum List<'a> {
-    Reflect(&'a dyn ReflectList),
+    /// A repeated field, read from its message's encoding.
+    Field(Field<'a>),
     Owned(Rc<[Value<'a>]>),
     Const(&'a [Const]),
 }
@@ -71,9 +79,22 @@ pub enum List<'a> {
 /// A map.
 #[derive(Clone)]
 pub enum Map<'a> {
-    Reflect(&'a dyn ReflectMap, ScalarType),
+    /// A map field, read from its message's encoding.
+    Field(Field<'a>),
     Owned(Rc<[(Value<'a>, Value<'a>)]>),
     Const(&'a [(Const, Const)]),
+}
+
+/// A repeated or map field of an encoded message.
+#[derive(Clone)]
+pub struct Field<'a> {
+    src: Src<'a>,
+    number: u32,
+    /// The kind of the items, or of the map's values.
+    kind: Kind,
+    card: Card,
+    wkt: Option<Wkt>,
+    pool: &'a Arc<DescriptorPool>,
 }
 
 /// A CEL type, as `type()` returns it.
@@ -130,10 +151,18 @@ pub enum Const {
     Bytes(Box<[u8]>),
     Duration(TimeDelta),
     Timestamp(DateTime<Utc>),
-    Message(Arc<DynamicMessage>),
+    Message(Arc<ConstMsg>),
     List(Box<[Self]>),
     Map(Box<[(Self, Self)]>),
     Type(Type),
+}
+
+/// An encoded message kept in a plan.
+#[derive(Debug)]
+pub struct ConstMsg {
+    pub bytes: Box<[u8]>,
+    pub index: MessageIndex,
+    pub pool: Arc<DescriptorPool>,
 }
 
 impl std::ops::Deref for Str<'_> {
@@ -156,89 +185,89 @@ impl std::ops::Deref for Bin<'_> {
     }
 }
 
+/// How to read a field, worked out from its descriptor once.
+#[derive(Clone, Debug)]
+pub struct Read {
+    pub shape: Shape,
+    /// The well-known type of a message field or its elements.
+    pub wkt: Option<Wkt>,
+}
+
+impl Read {
+    pub fn of(md: &MessageDescriptor, fd: &FieldDescriptor, pool: &DescriptorPool) -> Self {
+        let shape = Shape::of(md, fd, pool);
+        let wkt = match shape.kind {
+            Kind::Message(m) => wkt(pool.message(m)),
+            _ => None,
+        };
+        Self { shape, wkt }
+    }
+}
+
 impl<'a> Msg<'a> {
-    pub fn descriptor(&self) -> &MessageDescriptor {
-        match self {
-            Self::Ref(m) => m.message_descriptor(),
-            Self::Default(md, _) => md,
-            Self::Owned(m) => m.message_descriptor(),
+    pub const fn new(src: Src<'a>, index: MessageIndex, pool: &'a Arc<DescriptorPool>) -> Self {
+        Self {
+            src,
+            index,
+            pool,
+            gathered: None,
         }
     }
 
-    fn pool(&self) -> &Arc<DescriptorPool> {
-        match self {
-            Self::Ref(m) => m.pool(),
-            Self::Default(_, pool) => pool,
-            Self::Owned(m) => m.pool(),
-        }
+    fn gathered(&self, number: u32) -> Option<&'a Found<'a>> {
+        let g = self.gathered?;
+        g.dispatch.get(number).map(|s| &g.found[s])
     }
 
+    pub fn descriptor(&self) -> &'a MessageDescriptor {
+        self.pool.message(self.index)
+    }
+
+    /// Whether a field is set, as `has()` asks.
     pub fn has(&self, fd: &FieldDescriptor) -> bool {
-        match self {
-            Self::Ref(m) => m.has(fd),
-            Self::Default(..) => false,
-            Self::Owned(m) => m.has(fd),
+        let read = Read::of(self.descriptor(), fd, self.pool);
+        self.has_read(&read)
+    }
+
+    pub fn has_read(&self, read: &Read) -> bool {
+        if let Some(found) = self.gathered(read.shape.number) {
+            return present(found, read, &self.src, self.pool);
         }
+        scan_has(&self.src, read, self.pool)
     }
 
     /// The field with the given index in the message's descriptor, read as
     /// CEL reads it: unset fields as their defaults, well-known types as
     /// their CEL values.
     pub fn field(&self, index: usize) -> Value<'a> {
-        let fd = &self.descriptor().fields()[index];
-        let read = match fd.kind() {
-            FieldKind::Singular(SingularKind::Message(idx)) => {
-                Read::Message(wkt(self.pool().message(idx)))
-            }
-            _ => Read::Value,
-        };
-        self.read(index, read, None)
+        let md = self.descriptor();
+        self.read(&Read::of(md, &md.fields()[index], self.pool))
     }
 
-    /// Reads a field whose [`Read`] was worked out when compiling; `present`
-    /// when the caller already asked.
-    pub fn read(&self, index: usize, read: Read, present: Option<bool>) -> Value<'a> {
-        if let (Self::Ref(m), Read::Message(w)) = (self, read) {
-            let fd = &m.message_descriptor().fields()[index];
-            if !present.unwrap_or_else(|| m.has(fd)) {
-                let FieldKind::Singular(SingularKind::Message(idx)) = fd.kind() else {
-                    unreachable!("read as a message field");
-                };
-                return default_message(m.pool().message(idx), m.pool());
-            }
-            return match m.get(fd) {
-                ValueRef::Message(ReflectCow::Borrowed(r)) => message_as(Msg::Ref(r), w),
-                v => from_field(v, fd),
+    /// Reads a field whose [`Read`] was worked out when compiling.
+    pub fn read(&self, read: &Read) -> Value<'a> {
+        let shape = &read.shape;
+        let gathered = self.gathered(shape.number);
+        if shape.card == Card::Singular {
+            return match gathered {
+                Some(found) => singular(found, &self.src, read, self.pool),
+                None => {
+                    let found = wire::singular(&self.src, shape, self.pool).unwrap_or_default();
+                    singular(&found, &self.src, read, self.pool)
+                }
             };
         }
-        if let (Self::Ref(m), Read::Value) = (self, read) {
-            let fd = &m.message_descriptor().fields()[index];
-            return from_field(m.get(fd), fd);
-        }
-        self.field_slow(index)
-    }
-
-    fn field_slow(&self, index: usize) -> Value<'a> {
-        match self {
-            Self::Ref(m) => {
-                let fd = &m.message_descriptor().fields()[index];
-                if let FieldKind::Singular(SingularKind::Message(idx)) = fd.kind()
-                    && !m.has(fd)
-                {
-                    return default_message(m.pool().message(idx), m.pool());
-                }
-                from_field(m.get(fd), fd)
-            }
-            Self::Default(md, pool) => default_field(&md.fields()[index], pool),
-            Self::Owned(m) => {
-                let fd = &m.message_descriptor().fields()[index];
-                if let FieldKind::Singular(SingularKind::Message(idx)) = fd.kind()
-                    && !m.has(fd)
-                {
-                    return owned(&default_message(m.pool().message(idx), m.pool()));
-                }
-                owned(&from_field(m.get(fd), fd))
-            }
+        let field = Field {
+            src: gathered.map_or_else(|| self.src.clone(), |f| self.src.within(&f.span)),
+            number: shape.number,
+            kind: shape.kind,
+            card: shape.card,
+            wkt: read.wkt,
+            pool: self.pool,
+        };
+        match shape.card {
+            Card::List => Value::List(List::Field(field)),
+            _ => Value::Map(Map::Field(field)),
         }
     }
 
@@ -256,82 +285,145 @@ impl<'a> Msg<'a> {
         Some(self.has(fd))
     }
 
-    pub fn to_dynamic(&self) -> DynamicMessage {
-        match self {
-            Self::Ref(m) => m.to_dynamic(),
-            Self::Default(md, pool) => {
-                let idx = pool
-                    .message_index(md.full_name())
-                    .expect("a message's descriptor is in its own pool");
-                DynamicMessage::new(Arc::clone(pool), idx)
-            }
-            Self::Owned(m) => (**m).clone(),
-        }
-    }
-
     fn same_type(&self, other: &Self) -> bool {
         self.descriptor().full_name() == other.descriptor().full_name()
     }
-}
 
-/// Converts a value read from a field.
-pub fn from_field<'a>(v: ValueRef<'a>, fd: &FieldDescriptor) -> Value<'a> {
-    match (v, fd.kind()) {
-        (ValueRef::Map(m), FieldKind::Map { key, .. }) => Value::Map(Map::Reflect(m, key)),
-        (v, _) => from_ref(v),
+    /// The message decoded, for comparing messages.
+    pub fn to_dynamic(&self) -> DynamicMessage {
+        DynamicMessage::decode(Arc::clone(self.pool), self.index, &self.src.to_vec())
+            .unwrap_or_else(|_| DynamicMessage::new(Arc::clone(self.pool), self.index))
     }
 }
 
-/// Converts a reflected value. A map read this way has no key type and is
-/// looked up by string; [`from_field`] keeps the key type.
-pub fn from_ref(v: ValueRef<'_>) -> Value<'_> {
-    match v {
-        ValueRef::Bool(b) => Value::Bool(b),
-        ValueRef::I32(i) | ValueRef::EnumNumber(i) => Value::Int(i64::from(i)),
-        ValueRef::I64(i) => Value::Int(i),
-        ValueRef::U32(u) => Value::Uint(u64::from(u)),
-        ValueRef::U64(u) => Value::Uint(u),
-        ValueRef::F32(f) => Value::Double(f64::from(f)),
-        ValueRef::F64(f) => Value::Double(f),
-        ValueRef::String(s) => Value::String(Str::Ref(s)),
-        ValueRef::Bytes(b) => Value::Bytes(Bin::Ref(b)),
-        ValueRef::Message(ReflectCow::Borrowed(m)) => message(Msg::Ref(m)),
-        ValueRef::Message(ReflectCow::Owned(m)) => message(Msg::Owned(Rc::new(*m))),
-        ValueRef::List(l) => Value::List(List::Reflect(l)),
-        ValueRef::Map(m) => Value::Map(Map::Reflect(m, ScalarType::String)),
-    }
-}
-
-/// Deep-copies a value out of a temporary message.
-fn owned<'a>(v: &Value<'_>) -> Value<'a> {
-    match v {
-        Value::Null => Value::Null,
-        Value::Bool(b) => Value::Bool(*b),
-        Value::Int(i) => Value::Int(*i),
-        Value::Uint(u) => Value::Uint(*u),
-        Value::Double(d) => Value::Double(*d),
-        Value::String(s) => Value::String(Str::Rc(Rc::from(&**s))),
-        Value::Bytes(b) => Value::Bytes(Bin::Rc(Rc::from(&**b))),
-        Value::Duration(d) => Value::Duration(*d),
-        Value::Timestamp(t) => Value::Timestamp(*t),
-        Value::Type(t) => Value::Type(*t),
-        Value::Message(Msg::Owned(m)) => Value::Message(Msg::Owned(Rc::clone(m))),
-        Value::Message(m) => Value::Message(Msg::Owned(Rc::new(m.to_dynamic()))),
-        Value::List(l) => {
-            let mut items = Vec::with_capacity(l.len());
-            for i in 0..l.len() {
-                items.push(owned(&l.get(i).unwrap_or(Value::Null)));
-            }
-            Value::List(List::Owned(items.into()))
+/// Whether a field is set, found by a pass over the message.
+fn scan_has(src: &Src<'_>, read: &Read, pool: &Arc<DescriptorPool>) -> bool {
+    let shape = &read.shape;
+    match shape.card {
+        Card::Singular => {
+            wire::singular(src, shape, pool).is_ok_and(|found| present(&found, read, src, pool))
         }
-        Value::Map(m) => {
-            let mut entries = Vec::with_capacity(m.len());
-            m.for_each(&mut |k, v| {
-                entries.push((owned(&k), owned(&v)));
-                true
+
+        Card::List => {
+            let mut any = false;
+            let _ = wire::elements(src, shape.number, shape.kind, pool, &mut |_| {
+                any = true;
+                false
             });
-            Value::Map(Map::Owned(entries.into()))
+            any
         }
+        Card::Map(key) => {
+            let mut any = false;
+            let _ = wire::entries(src, shape.number, key, shape.kind, pool, &mut |_| {
+                any = true;
+                false
+            });
+            any
+        }
+    }
+}
+
+/// Whether a field is set: present on the wire, and, without explicit
+/// presence, set to other than its zero value; a list or map, not empty.
+pub fn present(found: &Found<'_>, read: &Read, src: &Src<'_>, pool: &Arc<DescriptorPool>) -> bool {
+    match (read.shape.card, found.last) {
+        (_, None) => false,
+        (Card::Singular, Some(_)) if read.shape.explicit => true,
+        // A closed enum drops the values it does not declare, which may be
+        // all of them.
+        (Card::List | Card::Map(_), Some(_)) => {
+            !matches!(read.shape.kind, Kind::Enum(Some(_)))
+                || scan_has(&src.within(&found.span), read, pool)
+        }
+        (Card::Singular, Some(raw)) => match read.shape.kind {
+            Kind::Scalar(s) => !is_zero_scalar(&scalar(raw, s)),
+            Kind::Enum(_) => !is_zero_scalar(&scalar(raw, ScalarType::Int32)),
+            Kind::Message(_) => true,
+        },
+    }
+}
+
+fn is_zero_scalar(v: &Value<'_>) -> bool {
+    match v {
+        Value::Bool(b) => !b,
+        Value::Int(i) => *i == 0,
+        Value::Uint(u) => *u == 0,
+        Value::Double(d) => *d == 0.0,
+        Value::String(s) => s.is_empty(),
+        Value::Bytes(b) => b.is_empty(),
+        _ => false,
+    }
+}
+
+/// A singular field's value: its last occurrence, its occurrences merged,
+/// or its default.
+pub fn singular<'a>(
+    found: &Found<'a>,
+    parent: &Src<'a>,
+    read: &Read,
+    pool: &'a Arc<DescriptorPool>,
+) -> Value<'a> {
+    match (read.shape.kind, found.last) {
+        (Kind::Message(m), Some(_)) => message_as(
+            Msg::new(found.message(parent, read.shape.number), m, pool),
+            read.wkt,
+        ),
+        (Kind::Message(_), None) if matches!(read.wkt, Some(Wkt::Wrapper | Wkt::Value)) => {
+            Value::Null
+        }
+        (Kind::Message(m), None) => message_as(Msg::new(Src::EMPTY, m, pool), read.wkt),
+        (kind, Some(raw)) => element(raw, kind, None, pool),
+        (Kind::Scalar(s), None) => default_scalar(s),
+        (Kind::Enum(_), None) => Value::Int(0),
+    }
+}
+
+/// One occurrence's value: a scalar, or one message (not merged).
+#[expect(clippy::cast_possible_truncation, reason = "the wire's truncations")]
+#[expect(clippy::cast_possible_wrap, reason = "the wire's reinterpretations")]
+pub fn element<'a>(
+    raw: Raw<'a>,
+    kind: Kind,
+    wkt: Option<Wkt>,
+    pool: &'a Arc<DescriptorPool>,
+) -> Value<'a> {
+    match (kind, raw) {
+        (Kind::Scalar(s), raw) => scalar(raw, s),
+        (Kind::Enum(_), Raw::Varint(v)) => Value::Int(i64::from(v as i32)),
+        (Kind::Message(m), Raw::Len(b) | Raw::Group(b)) => {
+            message_as(Msg::new(Src::Bytes(b), m, pool), wkt)
+        }
+        _ => Value::Null,
+    }
+}
+
+/// A scalar occurrence's value.
+#[expect(clippy::cast_possible_truncation, reason = "the wire's truncations")]
+#[expect(clippy::cast_possible_wrap, reason = "the wire's reinterpretations")]
+pub fn scalar(raw: Raw<'_>, s: ScalarType) -> Value<'_> {
+    match (s, raw) {
+        (ScalarType::Int32, Raw::Varint(v)) => Value::Int(i64::from(v as i32)),
+        (ScalarType::Int64, Raw::Varint(v)) => Value::Int(v as i64),
+        (ScalarType::Uint32, Raw::Varint(v)) => Value::Uint(u64::from(v as u32)),
+        (ScalarType::Uint64, Raw::Varint(v)) | (ScalarType::Fixed64, Raw::I64(v)) => Value::Uint(v),
+        (ScalarType::Sint32, Raw::Varint(v)) => {
+            let v = v as u32;
+            Value::Int(i64::from((v >> 1) as i32 ^ -((v & 1) as i32)))
+        }
+        (ScalarType::Sint64, Raw::Varint(v)) => Value::Int((v >> 1) as i64 ^ -((v & 1) as i64)),
+        (ScalarType::Bool, Raw::Varint(v)) => Value::Bool(v != 0),
+        (ScalarType::Sfixed64, Raw::I64(v)) => Value::Int(v as i64),
+        (ScalarType::Double, Raw::I64(v)) => Value::Double(f64::from_bits(v)),
+        (ScalarType::Fixed32, Raw::I32(v)) => Value::Uint(u64::from(v)),
+        (ScalarType::Sfixed32, Raw::I32(v)) => Value::Int(i64::from(v as i32)),
+        (ScalarType::Float, Raw::I32(v)) => Value::Double(f64::from(f32::from_bits(v))),
+        (ScalarType::String, Raw::Len(b)) => match std::str::from_utf8(b) {
+            Ok(s) => Value::String(Str::Ref(s)),
+            // Not a valid encoding, which decoding rejects; read leniently.
+            Err(_) => Value::String(Str::Rc(String::from_utf8_lossy(b).into())),
+        },
+        (ScalarType::Bytes, Raw::Len(b)) => Value::Bytes(Bin::Ref(b)),
+        (s, _) => default_scalar(s),
     }
 }
 
@@ -365,31 +457,6 @@ pub fn wkt(md: &MessageDescriptor) -> Option<Wkt> {
 }
 
 /// A message as CEL sees it: well-known types become their CEL values.
-pub fn message(m: Msg<'_>) -> Value<'_> {
-    let w = wkt(m.descriptor());
-    message_as(m, w)
-}
-
-/// What reading a field yields, worked out from its descriptor once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Read {
-    Value,
-    /// A singular message field, and which well-known type it is.
-    Message(Option<Wkt>),
-}
-
-impl Read {
-    pub fn of(fd: &FieldDescriptor, pool: &DescriptorPool) -> Self {
-        match fd.kind() {
-            FieldKind::Singular(SingularKind::Message(idx)) => {
-                Self::Message(wkt(pool.message(idx)))
-            }
-            _ => Self::Value,
-        }
-    }
-}
-
-/// [`message`], for a message whose well-known type is already known.
 pub fn message_as(m: Msg<'_>, w: Option<Wkt>) -> Value<'_> {
     match w {
         Some(Wkt::Timestamp) => match seconds_nanos(&m) {
@@ -411,10 +478,22 @@ pub fn message_as(m: Msg<'_>, w: Option<Wkt>) -> Value<'_> {
     }
 }
 
+/// A `Timestamp`'s or `Duration`'s fields: `int64 seconds = 1`, `int32 nanos
+/// = 2`.
+#[expect(clippy::cast_possible_truncation, reason = "the wire's truncations")]
+#[expect(clippy::cast_possible_wrap, reason = "the wire's reinterpretations")]
 fn seconds_nanos(m: &Msg<'_>) -> Option<(i64, i64)> {
-    let (Value::Int(s), Value::Int(n)) = (m.field(0), m.field(1)) else {
-        return None;
-    };
+    let (mut s, mut n) = (0, 0);
+    m.src
+        .visit(&mut |number, raw| {
+            match (number, raw) {
+                (1, Raw::Varint(v)) => s = v as i64,
+                (2, Raw::Varint(v)) => n = i64::from(v as i32),
+                _ => {}
+            }
+            Ok::<(), wire::Malformed>(())
+        })
+        .ok()?;
     Some((s, n))
 }
 
@@ -429,29 +508,6 @@ fn json_value<'a>(m: &Msg<'a>) -> Value<'a> {
         }
     }
     Value::Null
-}
-
-pub fn default_message<'a>(md: &'a MessageDescriptor, pool: &'a Arc<DescriptorPool>) -> Value<'a> {
-    match wkt(md) {
-        Some(Wkt::Timestamp) => Value::Timestamp(DateTime::UNIX_EPOCH),
-        Some(Wkt::Duration) => Value::Duration(TimeDelta::zero()),
-        Some(Wkt::Wrapper | Wkt::Value) => Value::Null,
-        Some(Wkt::Struct) => Value::Map(Map::Owned(Rc::new([]))),
-        Some(Wkt::ListValue) => Value::List(List::Owned(Rc::new([]))),
-        _ => Value::Message(Msg::Default(md, pool)),
-    }
-}
-
-fn default_field<'a>(fd: &'a FieldDescriptor, pool: &'a Arc<DescriptorPool>) -> Value<'a> {
-    static EMPTY_LIST: [Const; 0] = [];
-    static EMPTY_MAP: [(Const, Const); 0] = [];
-    match fd.kind() {
-        FieldKind::Singular(SingularKind::Scalar(s)) => default_scalar(s),
-        FieldKind::Singular(SingularKind::Enum(_)) => Value::Int(0),
-        FieldKind::Singular(SingularKind::Message(idx)) => default_message(pool.message(idx), pool),
-        FieldKind::List(_) => Value::List(List::Const(&EMPTY_LIST)),
-        FieldKind::Map { .. } => Value::Map(Map::Const(&EMPTY_MAP)),
-    }
 }
 
 pub const fn default_scalar(s: ScalarType) -> Value<'static> {
@@ -472,10 +528,87 @@ pub const fn default_scalar(s: ScalarType) -> Value<'static> {
     }
 }
 
+impl<'a> Field<'a> {
+    fn each(&self, f: &mut dyn FnMut(Value<'a>) -> bool) {
+        let _ = wire::elements(&self.src, self.number, self.kind, self.pool, &mut |raw| {
+            f(element(raw, self.kind, self.wkt, self.pool))
+        });
+    }
+
+    /// Visits each entry whose key no later entry repeats: the entries a
+    /// decoder keeps.
+    fn entries(&self, f: &mut dyn FnMut(Value<'a>, Value<'a>) -> bool) {
+        const SMALL: usize = 16;
+        let Card::Map(key) = self.card else {
+            return;
+        };
+        let key_of = |e: &wire::Entry<'a>| e.key.map_or(default_scalar(key), |k| scalar(k, key));
+        let value_read = Read {
+            shape: Shape::entry(2, self.kind),
+            wkt: self.wkt,
+        };
+        let value_of = |e: &wire::Entry<'a>| singular(&e.value, &e.src, &value_read, self.pool);
+        let (number, kind) = (self.number, self.kind);
+        // Few entries are checked for repeated keys pairwise, on the stack.
+        let mut small = [const { None }; SMALL];
+        let mut n = 0;
+        let _ = wire::entries(&self.src, number, key, kind, self.pool, &mut |e| {
+            if n < SMALL {
+                small[n] = Some((key_of(&e), e));
+            }
+            n += 1;
+            n <= SMALL
+        });
+        if n <= SMALL {
+            let small = &small[..n];
+            for (i, (k, e)) in small.iter().flatten().enumerate() {
+                if small[i + 1..]
+                    .iter()
+                    .flatten()
+                    .any(|(later, _)| equals(k, later))
+                {
+                    continue;
+                }
+                if !f(k.clone(), value_of(e)) {
+                    break;
+                }
+            }
+            return;
+        }
+        let mut all = Vec::with_capacity(n);
+        let _ = wire::entries(&self.src, number, key, kind, self.pool, &mut |e| {
+            all.push((key_of(&e), value_of(&e)));
+            true
+        });
+        // Stable, so the last of equal keys sorts last.
+        all.sort_by(|a, b| {
+            compare(&a.0, &b.0)
+                .ok()
+                .flatten()
+                .unwrap_or(Ordering::Equal)
+        });
+        for (i, (k, v)) in all.iter().enumerate() {
+            if all.get(i + 1).is_some_and(|next| equals(k, &next.0)) {
+                continue;
+            }
+            if !f(k.clone(), v.clone()) {
+                break;
+            }
+        }
+    }
+}
+
 impl<'a> List<'a> {
     pub fn len(&self) -> usize {
         match self {
-            Self::Reflect(l) => l.len(),
+            Self::Field(field) => {
+                let mut n = 0;
+                field.each(&mut |_| {
+                    n += 1;
+                    true
+                });
+                n
+            }
             Self::Owned(l) => l.len(),
             Self::Const(l) => l.len(),
         }
@@ -483,9 +616,51 @@ impl<'a> List<'a> {
 
     pub fn get(&self, i: usize) -> Option<Value<'a>> {
         match self {
-            Self::Reflect(l) => l.get(i).map(from_ref),
+            Self::Field(field) => {
+                let mut at = 0;
+                let mut out = None;
+                field.each(&mut |item| {
+                    if at == i {
+                        out = Some(item);
+                        return false;
+                    }
+                    at += 1;
+                    true
+                });
+                out
+            }
             Self::Owned(l) => l.get(i).cloned(),
             Self::Const(l) => l.get(i).map(Value::from_const),
+        }
+    }
+
+    pub fn items(&self) -> Vec<Value<'a>> {
+        let mut out = Vec::new();
+        self.for_each(&mut |v| {
+            out.push(v);
+            true
+        });
+        out
+    }
+
+    /// Visits every item until `f` returns false.
+    pub fn for_each(&self, f: &mut dyn FnMut(Value<'a>) -> bool) {
+        match self {
+            Self::Field(field) => field.each(f),
+            Self::Owned(l) => {
+                for item in l.iter() {
+                    if !f(item.clone()) {
+                        break;
+                    }
+                }
+            }
+            Self::Const(l) => {
+                for item in &**l {
+                    if !f(Value::from_const(item)) {
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -493,7 +668,14 @@ impl<'a> List<'a> {
 impl<'a> Map<'a> {
     pub fn len(&self) -> usize {
         match self {
-            Self::Reflect(m, _) => m.len(),
+            Self::Field(_) => {
+                let mut n = 0;
+                self.for_each(&mut |_, _| {
+                    n += 1;
+                    true
+                });
+                n
+            }
             Self::Owned(m) => m.len(),
             Self::Const(m) => m.len(),
         }
@@ -502,19 +684,7 @@ impl<'a> Map<'a> {
     /// Visits every entry until `f` returns false.
     pub fn for_each(&self, f: &mut dyn FnMut(Value<'a>, Value<'a>) -> bool) {
         match self {
-            Self::Reflect(m, _) => {
-                let mut go = true;
-                m.for_each(&mut |k, v| {
-                    if go {
-                        // SAFETY: `ReflectMap::for_each` hands out keys and
-                        // values borrowed from the map, which lives for 'a;
-                        // its signature only cannot say so.
-                        let (k, v): (MapKeyRef<'a>, ValueRef<'a>) =
-                            unsafe { std::mem::transmute((k, v)) };
-                        go = f(map_key(k), from_ref(v));
-                    }
-                });
-            }
+            Self::Field(field) => field.entries(f),
             Self::Owned(m) => {
                 for (k, v) in m.iter() {
                     if !f(k.clone(), v.clone()) {
@@ -533,83 +703,22 @@ impl<'a> Map<'a> {
     }
 
     pub fn get(&self, key: &Value<'_>) -> Result<Option<Value<'a>>, Error> {
-        match self {
-            Self::Reflect(m, kt) => {
-                let found = match key {
-                    Value::String(s) => m.get_str(s),
-                    Value::Bool(b) => m.get(&MapKey::Bool(*b)),
-                    Value::Int(_) | Value::Uint(_) | Value::Double(_) => {
-                        let Some(k) = int_key(key, *kt) else {
-                            return Ok(None);
-                        };
-                        m.get(&k)
-                    }
-                    _ => return Err(Error::new("unsupported map key type")),
-                };
-                // SAFETY: as in `for_each`, the value borrows from the map.
-                Ok(found.map(|v| {
-                    from_ref(unsafe { std::mem::transmute::<ValueRef<'_>, ValueRef<'a>>(v) })
-                }))
+        if !matches!(
+            key,
+            Value::String(_) | Value::Bool(_) | Value::Int(_) | Value::Uint(_) | Value::Double(_)
+        ) {
+            return Err(Error::new("unsupported map key type"));
+        }
+        let mut out = None;
+        self.for_each(&mut |k, v| {
+            if equals(&k, key) {
+                out = Some(v);
+                false
+            } else {
+                true
             }
-            Self::Owned(_) | Self::Const(_) => {
-                let mut out = None;
-                self.for_each(&mut |k, v| {
-                    if equals(&k, key) {
-                        out = Some(v);
-                        false
-                    } else {
-                        true
-                    }
-                });
-                Ok(out)
-            }
-        }
-    }
-}
-
-fn int_key(key: &Value<'_>, kt: ScalarType) -> Option<MapKey> {
-    let (i, u) = match *key {
-        Value::Int(i) => (Some(i), u64::try_from(i).ok()),
-        Value::Uint(u) => (i64::try_from(u).ok(), Some(u)),
-        Value::Double(d) if d.fract() == 0.0 => {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "integral and range-checked"
-            )]
-            let i = (-9.223_372_036_854_776e18..9.223_372_036_854_776e18)
-                .contains(&d)
-                .then_some(d as i64);
-            #[expect(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "integral and range-checked"
-            )]
-            let u = (0.0..1.844_674_407_370_955_2e19)
-                .contains(&d)
-                .then_some(d as u64);
-            (i, u)
-        }
-        _ => return None,
-    };
-    Some(match kt {
-        ScalarType::Int32 | ScalarType::Sint32 | ScalarType::Sfixed32 => {
-            MapKey::I32(i32::try_from(i?).ok()?)
-        }
-        ScalarType::Int64 | ScalarType::Sint64 | ScalarType::Sfixed64 => MapKey::I64(i?),
-        ScalarType::Uint32 | ScalarType::Fixed32 => MapKey::U32(u32::try_from(u?).ok()?),
-        ScalarType::Uint64 | ScalarType::Fixed64 => MapKey::U64(u?),
-        _ => return None,
-    })
-}
-
-pub fn map_key(k: MapKeyRef<'_>) -> Value<'_> {
-    match k {
-        MapKeyRef::Bool(b) => Value::Bool(b),
-        MapKeyRef::I32(i) => Value::Int(i64::from(i)),
-        MapKeyRef::I64(i) => Value::Int(i),
-        MapKeyRef::U32(u) => Value::Uint(u64::from(u)),
-        MapKeyRef::U64(u) => Value::Uint(u),
-        MapKeyRef::String(s) => Value::String(Str::Ref(s)),
+        });
+        Ok(out)
     }
 }
 
@@ -625,7 +734,7 @@ impl<'a> Value<'a> {
             Const::Bytes(b) => Self::Bytes(Bin::Ref(b)),
             Const::Duration(d) => Self::Duration(*d),
             Const::Timestamp(t) => Self::Timestamp(*t),
-            Const::Message(m) => Self::Message(Msg::Ref(&**m)),
+            Const::Message(m) => Self::Message(Msg::new(Src::Bytes(&m.bytes), m.index, &m.pool)),
             Const::List(l) => Self::List(List::Const(l)),
             Const::Map(m) => Self::Map(Map::Const(m)),
             Const::Type(t) => Self::Type(*t),
@@ -643,14 +752,21 @@ impl<'a> Value<'a> {
             Self::Bytes(b) => Const::Bytes((**b).into()),
             Self::Duration(d) => Const::Duration(*d),
             Self::Timestamp(t) => Const::Timestamp(*t),
-            Self::Message(m) => Const::Message(Arc::new(m.to_dynamic())),
-            Self::List(l) => Const::List(
-                (0..l.len())
-                    .map(|i| l.get(i).map_or(Const::Null, |v| v.to_const()))
-                    .collect(),
-            ),
+            Self::Message(m) => Const::Message(Arc::new(ConstMsg {
+                bytes: m.src.to_vec().into(),
+                index: m.index,
+                pool: Arc::clone(m.pool),
+            })),
+            Self::List(l) => {
+                let mut items = Vec::new();
+                l.for_each(&mut |v| {
+                    items.push(v.to_const());
+                    true
+                });
+                Const::List(items.into())
+            }
             Self::Map(m) => {
-                let mut entries = Vec::with_capacity(m.len());
+                let mut entries = Vec::new();
                 m.for_each(&mut |k, v| {
                     entries.push((k.to_const(), v.to_const()));
                     true
@@ -697,11 +813,19 @@ pub fn equals(a: &Value<'_>, b: &Value<'_>) -> bool {
         (Value::Timestamp(x), Value::Timestamp(y)) => x == y,
         (Value::Type(x), Value::Type(y)) => x == y,
         (Value::List(x), Value::List(y)) => {
-            x.len() == y.len()
-                && (0..x.len()).all(|i| match (x.get(i), y.get(i)) {
-                    (Some(p), Some(q)) => equals(&p, &q),
-                    _ => false,
-                })
+            let mut ys = Vec::new();
+            y.for_each(&mut |v| {
+                ys.push(v);
+                true
+            });
+            let mut i = 0;
+            let mut eq = true;
+            x.for_each(&mut |v| {
+                eq = ys.get(i).is_some_and(|w| equals(&v, w));
+                i += 1;
+                eq
+            });
+            eq && i == ys.len()
         }
         (Value::Map(x), Value::Map(y)) => {
             if x.len() != y.len() {
@@ -792,10 +916,14 @@ impl fmt::Debug for Value<'_> {
             Self::Duration(d) => write!(f, "duration({d})"),
             Self::Timestamp(t) => write!(f, "timestamp({t})"),
             Self::Message(m) => write!(f, "{}{{..}}", m.descriptor().full_name()),
-            Self::List(l) => f
-                .debug_list()
-                .entries((0..l.len()).filter_map(|i| l.get(i)))
-                .finish(),
+            Self::List(l) => {
+                let mut d = f.debug_list();
+                l.for_each(&mut |v| {
+                    d.entry(&v);
+                    true
+                });
+                d.finish()
+            }
             Self::Map(m) => {
                 let mut d = f.debug_map();
                 m.for_each(&mut |k, v| {

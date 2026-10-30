@@ -2,21 +2,23 @@
 
 use std::borrow::Cow;
 
-use buffa_descriptor::reflect::ReflectMessage;
 use protovalidate_buffa::{FieldPath, FieldPathElement, FieldType, Subscript, Violation};
 
 use crate::{
     cel::{
         Clock, Outcome,
-        value::{List, Map, Msg, Value},
+        value::{self, Gathered, List, Map, Msg, Value},
     },
     plan::{Check, Elem, MessagePlan, Plans, ValuePlan},
+    wire::{self, Card, Found, Malformed, Raw},
 };
 
 /// Why a validation stopped before it finished.
 pub enum Abort {
     Compile(String),
     Runtime(String),
+    /// The bytes are not an encoding of the message.
+    Malformed,
 }
 
 /// Where a value sits, as a chain of frames on the stack: the path is only
@@ -43,6 +45,7 @@ enum RulePath<'a> {
 pub struct Walker<'a> {
     plans: &'a Plans,
     clock: Clock,
+    depth: u32,
     pub violations: Vec<Violation>,
 }
 
@@ -51,12 +54,13 @@ impl<'a> Walker<'a> {
         Self {
             plans,
             clock: Clock::default(),
+            depth: 0,
             violations: Vec::new(),
         }
     }
 
-    pub fn root(&mut self, msg: &'a dyn ReflectMessage) -> Result<(), Abort> {
-        self.message(0, &Msg::Ref(msg), None)
+    pub fn root(&mut self, msg: &Msg<'a>) -> Result<(), Abort> {
+        self.message(0, msg, None)
     }
 
     fn message(
@@ -65,13 +69,59 @@ impl<'a> Walker<'a> {
         msg: &Msg<'a>,
         path: Option<&Path<'_, 'a>>,
     ) -> Result<(), Abort> {
+        const INLINE: usize = 16;
         let plans = self.plans;
         let plan: &'a MessagePlan = &plans.messages[plan];
         if let Some(e) = &plan.error {
             return Err(Abort::Compile(e.clone()));
         }
+        if self.depth >= wire::DEPTH {
+            return Err(Abort::Malformed);
+        }
+        let pool = msg.pool;
+
+        // One pass over the encoding finds the fields the plan reads.
+        let mut inline = [const { Found::EMPTY }; INLINE];
+        let mut heap = Vec::new();
+        let found: &mut [Found<'a>] = if plan.slots.len() <= INLINE {
+            &mut inline[..plan.slots.len()]
+        } else {
+            heap.resize(plan.slots.len(), Found::EMPTY);
+            &mut heap
+        };
+        if !plan.slots.is_empty() {
+            msg.src
+                .visit_at(&mut |n, raw, at| {
+                    if let Some(s) = plan.dispatch.get(n) {
+                        let slot = &plan.slots[s];
+                        let shape = &slot.read.shape;
+                        if shape.accepts(raw, pool)
+                            && !(shape.card == Card::List
+                                && shape.kind.packable()
+                                && matches!(raw, Raw::Len([])))
+                        {
+                            for &other in &slot.siblings {
+                                found[other].clear();
+                            }
+                            found[s].take_at(raw, at);
+                        }
+                    }
+                    Ok::<(), Malformed>(())
+                })
+                .map_err(|_| Abort::Malformed)?;
+        }
+        let found: &[Found<'a>] = found;
+        let present = |s: usize| value::present(&found[s], &plan.slots[s].read, &msg.src, pool);
+
         if !plan.rules.is_empty() {
-            let this = Value::Message(msg.clone());
+            let gathered = Gathered {
+                dispatch: &plan.dispatch,
+                found,
+            };
+            let this = Value::Message(Msg {
+                gathered: Some(&gathered),
+                ..msg.clone()
+            });
             for rule in &plan.rules {
                 match rule.program.eval(&this, &self.clock) {
                     Ok(Outcome::Pass) => {}
@@ -90,13 +140,8 @@ impl<'a> Walker<'a> {
                 }
             }
         }
-        let md = msg.descriptor();
         for o in &plan.message_oneofs {
-            let set = o
-                .fields
-                .iter()
-                .filter(|&&f| msg.has(&md.fields()[f]))
-                .count();
+            let set = o.fields.iter().filter(|&&s| present(s)).count();
             let message = if set > 1 {
                 format!("only one of {} can be set", o.names)
             } else if o.required && set == 0 {
@@ -113,14 +158,8 @@ impl<'a> Walker<'a> {
                 false,
             );
         }
-        for (i, name) in &plan.oneofs {
-            let oneof = &md.oneofs()[*i];
-            let set = match msg {
-                Msg::Ref(m) => m.which_oneof(oneof).is_some(),
-                Msg::Owned(m) => m.which_oneof(oneof).is_some(),
-                Msg::Default(..) => false,
-            };
-            if !set {
+        for (members, name) in &plan.oneofs {
+            if !members.iter().any(|&s| found[s].last.is_some()) {
                 self.report(
                     path,
                     Some(name),
@@ -131,12 +170,12 @@ impl<'a> Walker<'a> {
                 );
             }
         }
+        self.depth += 1;
         for field in &plan.fields {
             if let Some(e) = &field.error {
                 return Err(Abort::Compile(e.clone()));
             }
-            let fd = &md.fields()[field.index];
-            let present = msg.has(fd);
+            let present = present(field.slot);
             let here = Path {
                 parent: path,
                 elem: &field.elem,
@@ -156,9 +195,14 @@ impl<'a> Walker<'a> {
             if field.skip_unset && !present {
                 continue;
             }
-            let value = msg.read(field.index, field.read, Some(present));
+            let read = &plan.slots[field.slot].read;
+            let value = match read.shape.card {
+                Card::Singular => value::singular(&found[field.slot], &msg.src, read, pool),
+                _ => Msg::new(msg.src.within(&found[field.slot].span), msg.index, pool).read(read),
+            };
             self.value(&field.value, &value, &here, false)?;
         }
+        self.depth -= 1;
         Ok(())
     }
 
@@ -249,16 +293,19 @@ impl<'a> Walker<'a> {
         list: &List<'a>,
         path: &Path<'_, 'a>,
     ) -> Result<(), Abort> {
-        for i in 0..list.len() {
-            let Some(item) = list.get(i) else { continue };
+        let mut result = Ok(());
+        let mut i = 0;
+        list.for_each(&mut |item| {
             let here = Path {
                 parent: path.parent,
                 elem: path.elem,
                 sub: Sub::Index(i),
             };
-            self.value(plan, &item, &here, false)?;
-        }
-        Ok(())
+            i += 1;
+            result = self.value(plan, &item, &here, false);
+            result.is_ok()
+        });
+        result
     }
 
     fn entries(
@@ -371,7 +418,7 @@ fn rule_element(e: &Elem) -> FieldPathElement {
 
 fn is_zero(v: &Value<'_>) -> bool {
     match v {
-        Value::Null | Value::Message(Msg::Default(..)) => true,
+        Value::Null => true,
         Value::Bool(b) => !b,
         Value::Int(i) => *i == 0,
         Value::Uint(u) => *u == 0,

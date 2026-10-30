@@ -1,6 +1,8 @@
-//! The reflection validator against the plugin's generated validators, on the
-//! same conformance messages: time and heap allocations per validation of a
-//! valid message.
+//! The descriptor-driven validator against the plugin's generated validators,
+//! on the same conformance messages: time and heap allocations per validation
+//! of a valid message. A message in hand is validated by the generated
+//! validator, or encoded and validated; an encoded one (a request) by
+//! decoding it for the generated validator, or validating its encoding.
 //!
 //! `cargo bench -p protovalidate-buffa-reflect-conformance`
 
@@ -85,6 +87,14 @@ fn bench<M>(name: &str, json: &str)
 where
     M: Message + ReflectMessage + Validate + Default,
 {
+    // `cargo bench -- <name>` runs the cases whose names contain it.
+    if std::env::args()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+        .is_some_and(|filter| !name.contains(&filter))
+    {
+        return;
+    }
     let pool = c::__buffa::reflect::descriptor_pool();
     let template = M::default();
     let idx = pool
@@ -99,27 +109,31 @@ where
         "{name}: the generated validator rejects the input"
     );
     assert!(
-        validator.validate(&typed).is_ok(),
-        "{name}: the reflection validator rejects the input: {:?}",
-        validator.validate(&typed)
+        validator.validate_encoded(pool, idx, &bytes).is_ok(),
+        "{name}: the validator rejects the input: {:?}",
+        validator.validate_encoded(pool, idx, &bytes)
     );
 
     let generated = measure(|| black_box(black_box(&typed).validate()).expect("valid"));
-    let reflected = measure(|| black_box(validator.validate(black_box(&typed))).expect("valid"));
-    let dynamic = measure(|| black_box(validator.validate(black_box(&dynamic))).expect("valid"));
-    let decode = measure(|| {
-        black_box(M::decode_from_slice(black_box(&bytes)).expect("decodes"));
+    let typed_ns = measure(|| black_box(validator.validate(black_box(&typed))).expect("valid"));
+    let decode_generated = measure(|| {
+        let m = M::decode_from_slice(black_box(&bytes)).expect("decodes");
+        black_box(m.validate()).expect("valid");
+    });
+    let encoded = measure(|| {
+        black_box(validator.validate_encoded(pool, idx, black_box(&bytes))).expect("valid");
     });
     println!(
-        "{name:<22} {:>5} B | generated {:>7.0} ns {:>4.1} alloc | reflect {:>7.0} ns {:>4.1} alloc ({:>4.1}x) | reflect, dynamic message {:>7.0} ns | decode {:>6.0} ns",
+        "{name:<29} {:>4} B | message: generated {:>5.0} ns, encode+validate {:>5.0} ns ({:>4.1}x) | encoded: decode+generated {:>5.0} ns {:>4.1} alloc, validate {:>5.0} ns {:>3.1} alloc ({:>4.2}x)",
         bytes.len(),
         generated.0,
-        generated.1,
-        reflected.0,
-        reflected.1,
-        reflected.0 / generated.0,
-        dynamic.0,
-        decode.0,
+        typed_ns.0,
+        typed_ns.0 / generated.0,
+        decode_generated.0,
+        decode_generated.1,
+        encoded.0,
+        encoded.1,
+        encoded.0 / decode_generated.0,
     );
 }
 

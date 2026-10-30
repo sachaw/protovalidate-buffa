@@ -89,11 +89,7 @@ impl Ty {
             Const::Bytes(_) => Self::Bytes,
             Const::Duration(_) => Self::Duration,
             Const::Timestamp(_) => Self::Timestamp,
-            Const::Message(m) => {
-                use buffa_descriptor::reflect::ReflectMessage as _;
-                pool.message_index(m.message_descriptor().full_name())
-                    .map_or(Self::Dyn, |idx| Self::of_message(idx, pool))
-            }
+            Const::Message(m) => Self::of_message(m.index, pool),
             Const::List(items) => Self::List(Box::new(
                 items.first().map_or(Self::Dyn, |i| Self::of_const(i, pool)),
             )),

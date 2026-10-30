@@ -21,7 +21,6 @@ use cel::{
         },
         value::{CowVal, Val},
     },
-    context::VariableResolver,
 };
 
 use super::{
@@ -61,25 +60,16 @@ impl Program {
 
     #[inline(never)]
     pub fn eval<'a>(&'a self, this: &Value<'a>, clock: &Clock) -> Result<Outcome<'a>, Error> {
-        let mut vars: Vec<(&str, Box<dyn Val + '_>)> = vec![
-            ("this", to_val(this, &self.has)),
-            (
-                "now",
-                Box::new(CelTimestamp::from(clock.now().fixed_offset())),
-            ),
-        ];
-        for (name, c) in &self.consts {
-            vars.push((name, to_val(&Value::from_const(c), &self.has)));
-        }
-        let bind = Bind { vars };
         let mut cx = Context::with_env(Arc::clone(&ENV));
-        // SAFETY: the context only reads the resolver while `execute` runs,
-        // and is dropped before `bind`.
-        let resolver: &'static Bind<'static> = unsafe { std::mem::transmute(&bind) };
-        cx.set_variable_resolver(resolver);
-        let result = self.compiled.execute(&cx);
-        drop(cx);
-        match result {
+        cx.add_variable_as_val("this", to_val(this, &self.has));
+        cx.add_variable_as_val(
+            "now",
+            Box::new(CelTimestamp::from(clock.now().fixed_offset())),
+        );
+        for (name, c) in &self.consts {
+            cx.add_variable_as_val(*name, to_val(&Value::from_const(c), &self.has));
+        }
+        match self.compiled.execute(&cx) {
             Ok(cel::Value::Bool(true)) => Ok(Outcome::Pass),
             Ok(cel::Value::Bool(false)) => Ok(Outcome::Fail(None)),
             Ok(cel::Value::String(s)) if s.is_empty() => Ok(Outcome::Pass),
@@ -89,24 +79,6 @@ impl Program {
             ))),
             Err(e) => Err(Error::new(e.to_string())),
         }
-    }
-}
-
-struct Bind<'a> {
-    vars: Vec<(&'a str, Box<dyn Val + 'a>)>,
-}
-
-// SAFETY: a `Bind` is made, read and dropped by one thread, in one
-// evaluation; `cel` requires the bound for resolvers it may share.
-unsafe impl Send for Bind<'_> {}
-unsafe impl Sync for Bind<'_> {}
-
-impl VariableResolver for Bind<'_> {
-    fn resolve<'b>(&'b self, variable: &str) -> Option<CowVal<'b, 'b>> {
-        self.vars
-            .iter()
-            .find(|(n, _)| *n == variable)
-            .map(|(_, v)| CowVal::Borrowed(&**v))
     }
 }
 
@@ -157,10 +129,11 @@ fn to_val<'a>(v: &Value<'a>, has: &'a HashSet<String>) -> Box<dyn Val + 'a> {
         Value::Type(t) => Box::new(CelString::from(t.name())),
         Value::Message(m) => Box::new(MsgVal { m: m.clone(), has }),
         Value::List(l) => {
-            let items: Vec<_> = (0..l.len())
-                .filter_map(|i| l.get(i))
-                .map(|item| to_val(&item, has))
-                .collect();
+            let mut items = Vec::new();
+            l.for_each(&mut |item| {
+                items.push(to_val(&item, has));
+                true
+            });
             Box::new(CelList::from(items))
         }
         Value::Map(m) => {
@@ -188,12 +161,6 @@ struct MsgVal<'a> {
     m: Msg<'a>,
     has: &'a HashSet<String>,
 }
-
-// SAFETY: as for `Bind`: `Msg` may hold an `Rc`, which this value never
-// shares beyond the evaluation's thread.
-#[expect(clippy::non_send_fields_in_send_ty, reason = "see the safety note")]
-unsafe impl Send for MsgVal<'_> {}
-unsafe impl Sync for MsgVal<'_> {}
 
 impl std::fmt::Debug for MsgVal<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
