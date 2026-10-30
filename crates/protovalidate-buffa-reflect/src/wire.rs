@@ -33,7 +33,7 @@ pub enum Raw<'a> {
     Group(&'a [u8]),
 }
 
-#[inline]
+#[inline(always)]
 fn varint(buf: &mut &[u8]) -> Result<u64, Malformed> {
     if let Some((&b, rest)) = buf.split_first()
         && b < 0x80
@@ -41,6 +41,11 @@ fn varint(buf: &mut &[u8]) -> Result<u64, Malformed> {
         *buf = rest;
         return Ok(u64::from(b));
     }
+    long_varint(buf)
+}
+
+#[inline(never)]
+fn long_varint(buf: &mut &[u8]) -> Result<u64, Malformed> {
     let mut v = 0u64;
     for (i, &b) in buf.iter().take(10).enumerate() {
         v |= u64::from(b & 0x7f) << (7 * i);
@@ -62,7 +67,8 @@ fn take<'a>(buf: &mut &'a [u8], n: usize) -> Result<&'a [u8], Malformed> {
 }
 
 /// Reads one field: its number and value. A group is read to its end tag.
-#[inline]
+// Inlined into each loop, so the field is not returned through memory.
+#[inline(always)]
 fn field<'a>(buf: &mut &'a [u8], depth: u32) -> Result<(u32, Raw<'a>), Malformed> {
     let tag = varint(buf)?;
     let number = u32::try_from(tag >> 3).map_err(|_| Malformed)?;
@@ -134,8 +140,8 @@ impl<'a> Src<'a> {
         self.visit_at(&mut |n, raw, _| f(n, raw))
     }
 
-    /// [`visit`](Self::visit), with where each field sits in the bytes of a
-    /// [`Src::Bytes`] (for a merged message, an empty range).
+    /// [`visit`](Self::visit), with where each field sits in the
+    /// [`base`](Self::base) bytes.
     #[inline]
     pub fn visit_at<E: From<Malformed>>(
         &self,
@@ -151,15 +157,23 @@ impl<'a> Src<'a> {
                 }
                 Ok(())
             }
-            Self::Merged(m) => m.visit(&mut |n, raw| f(n, raw, 0..0)),
+            Self::Merged(m) => m.visit_at(f),
+        }
+    }
+
+    /// The bytes every field of the message is part of.
+    pub fn base(&self) -> &'a [u8] {
+        match self {
+            Self::Bytes(b) => b,
+            Self::Merged(m) => m.parent.base(),
         }
     }
 
     /// The part of the message from `span`'s start to its end, which holds
     /// every occurrence of a field when `span` covers its first and last.
-    pub fn within(&self, span: &Range<usize>) -> Self {
+    pub fn within(&self, span: (u32, u32)) -> Self {
         match self {
-            Self::Bytes(b) => Self::Bytes(b.get(span.clone()).unwrap_or(b)),
+            Self::Bytes(b) => Self::Bytes(b.get(span.0 as usize..span.1 as usize).unwrap_or(b)),
             Self::Merged(_) => self.clone(),
         }
     }
@@ -198,11 +212,29 @@ impl<'a> Merged<'a> {
         })
     }
 
-    fn visit<E: From<Malformed>>(
+    fn visit_at<E: From<Malformed>>(
         &self,
-        f: &mut dyn FnMut(u32, Raw<'a>) -> Result<(), E>,
+        f: &mut dyn FnMut(u32, Raw<'a>, Range<usize>) -> Result<(), E>,
     ) -> Result<(), E> {
-        self.chunks(&mut |chunk| Src::Bytes(chunk).visit(&mut |n, raw| f(n, raw)))
+        let mut seen = 0;
+        self.parent.visit_at(&mut |n, raw, at| {
+            if n != self.number {
+                return Ok(());
+            }
+            let Some(chunk) = payload(raw, &at, n) else {
+                return Ok(());
+            };
+            seen += 1;
+            if seen <= self.skip {
+                return Ok(());
+            }
+            let (Raw::Len(bytes) | Raw::Group(bytes)) = raw else {
+                return Ok(());
+            };
+            Src::Bytes(bytes).visit_at(&mut |n, raw, inner| {
+                f(n, raw, chunk.start + inner.start..chunk.start + inner.end)
+            })
+        })
     }
 }
 
@@ -345,41 +377,112 @@ impl Shape {
     }
 }
 
+/// Where a length-delimited or group occurrence's contents sit, given where
+/// the whole field does.
+#[inline]
+fn payload(raw: Raw<'_>, at: &Range<usize>, number: u32) -> Option<Range<usize>> {
+    match raw {
+        Raw::Len(b) => Some(at.end - b.len()..at.end),
+        Raw::Group(b) => {
+            let end = at.end - varint_len(u64::from(number) << 3);
+            Some(end - b.len()..end)
+        }
+        _ => None,
+    }
+}
+
+const fn varint_len(v: u64) -> usize {
+    (64 - (v | 1).leading_zeros() as usize).div_ceil(7)
+}
+
+/// An occurrence's value, without the bytes it borrows: a length-delimited
+/// one is an offset and a length into its message's [`Src::base`].
+#[derive(Clone, Copy, Debug)]
+pub enum At {
+    Varint(u64),
+    I64(u64),
+    I32(u32),
+    Len(u32, u32),
+    Group(u32, u32),
+}
+
+impl At {
+    #[inline]
+    fn of(raw: Raw<'_>, at: &Range<usize>, number: u32) -> Self {
+        let span = |r: Range<usize>| {
+            (
+                u32::try_from(r.start).unwrap_or(u32::MAX),
+                u32::try_from(r.len()).unwrap_or(0),
+            )
+        };
+        match raw {
+            Raw::Varint(v) => Self::Varint(v),
+            Raw::I64(v) => Self::I64(v),
+            Raw::I32(v) => Self::I32(v),
+            Raw::Len(_) => {
+                let (s, l) = span(payload(raw, at, number).unwrap_or(0..0));
+                Self::Len(s, l)
+            }
+            Raw::Group(_) => {
+                let (s, l) = span(payload(raw, at, number).unwrap_or(0..0));
+                Self::Group(s, l)
+            }
+        }
+    }
+
+    #[inline]
+    pub fn raw(self, base: &[u8]) -> Raw<'_> {
+        let slice = |s: u32, l: u32| base.get(s as usize..(s + l) as usize).unwrap_or(&[]);
+        match self {
+            Self::Varint(v) => Raw::Varint(v),
+            Self::I64(v) => Raw::I64(v),
+            Self::I32(v) => Raw::I32(v),
+            Self::Len(s, l) => Raw::Len(slice(s, l)),
+            Self::Group(s, l) => Raw::Group(slice(s, l)),
+        }
+    }
+}
+
 /// A field's occurrences that count: the last one, how many there are since
-/// a sibling last cleared the field, and where they sit.
-#[derive(Clone, Default)]
-pub struct Found<'a> {
-    pub last: Option<Raw<'a>>,
+/// a sibling last cleared the field, and where they sit in their message's
+/// [`Src::base`].
+#[derive(Clone, Debug)]
+pub struct Found {
+    pub last: Option<At>,
     pub count: u32,
     pub total: u32,
     /// From the first occurrence's start to the last one's end.
-    pub span: Range<usize>,
+    pub span: (u32, u32),
 }
 
-impl<'a> Found<'a> {
+impl Default for Found {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl Found {
     pub const EMPTY: Self = Self {
         last: None,
         count: 0,
         total: 0,
-        span: 0..0,
+        span: (0, 0),
     };
 
-    /// Takes one occurrence of the field.
-    #[inline]
-    pub fn take(&mut self, raw: Raw<'a>) {
-        self.last = Some(raw);
+    /// Takes the occurrence of field `number` found at `at`.
+    #[inline(always)]
+    pub fn take(&mut self, raw: Raw<'_>, at: Range<usize>, number: u32) {
+        let (start, end) = (
+            u32::try_from(at.start).unwrap_or(u32::MAX),
+            u32::try_from(at.end).unwrap_or(u32::MAX),
+        );
+        if self.count == 0 {
+            self.span.0 = start;
+        }
+        self.span.1 = end;
+        self.last = Some(At::of(raw, &at, number));
         self.count += 1;
         self.total += 1;
-    }
-
-    /// Takes one occurrence of the field, found at `at`.
-    #[inline]
-    pub fn take_at(&mut self, raw: Raw<'a>, at: Range<usize>) {
-        if self.count == 0 {
-            self.span.start = at.start;
-        }
-        self.span.end = at.end;
-        self.take(raw);
     }
 
     /// A sibling oneof member was set.
@@ -389,9 +492,15 @@ impl<'a> Found<'a> {
         self.count = 0;
     }
 
+    /// The last occurrence, from the message it was found in.
+    #[inline]
+    pub fn last<'a>(&self, src: &Src<'a>) -> Option<Raw<'a>> {
+        self.last.map(|at| at.raw(src.base()))
+    }
+
     /// The field's message, merged from its occurrences.
-    pub fn message(&self, parent: &Src<'a>, number: u32) -> Src<'a> {
-        match self.last {
+    pub fn message<'a>(&self, parent: &Src<'a>, number: u32) -> Src<'a> {
+        match self.last(parent) {
             Some(Raw::Len(b) | Raw::Group(b)) if self.count == 1 => Src::Bytes(b),
             Some(_) => Src::Merged(Arc::new(Merged {
                 parent: parent.clone(),
@@ -404,16 +513,12 @@ impl<'a> Found<'a> {
 }
 
 /// Reads a singular field.
-pub fn singular<'a>(
-    src: &Src<'a>,
-    shape: &Shape,
-    pool: &DescriptorPool,
-) -> Result<Found<'a>, Malformed> {
-    let mut found = Found::default();
-    src.visit(&mut |n, raw| {
+pub fn singular(src: &Src<'_>, shape: &Shape, pool: &DescriptorPool) -> Result<Found, Malformed> {
+    let mut found = Found::EMPTY;
+    src.visit_at(&mut |n, raw, at| {
         if n == shape.number {
             if shape.kind.accepts(raw, pool) {
-                found.take(raw);
+                found.take(raw, at, n);
             }
         } else if let Some((_, k)) = shape.siblings.iter().find(|(s, _)| *s == n)
             && k.accepts(raw, pool)
@@ -497,7 +602,7 @@ pub fn elements<'a>(
 /// A map entry: its key and value as the decoder reads them.
 pub struct Entry<'a> {
     pub key: Option<Raw<'a>>,
-    pub value: Found<'a>,
+    pub value: Found,
     pub src: Src<'a>,
 }
 
@@ -519,20 +624,20 @@ pub fn entries<'a>(
         };
         let src = Src::Bytes(entry);
         let mut k = None;
-        let mut v = Found::default();
+        let mut v = Found::EMPTY;
         // A closed enum value the enum does not declare drops the entry.
         let mut dropped = false;
-        src.visit(&mut |n, raw| {
+        src.visit_at(&mut |n, raw, at| {
             match n {
                 1 if key.accepts(raw, pool) => k = Some(raw),
                 2 => match value {
                     Kind::Enum(Some(_)) if matches!(raw, Raw::Varint(_)) => {
                         dropped = !value.accepts(raw, pool);
                         if !dropped {
-                            v.take(raw);
+                            v.take(raw, at, n);
                         }
                     }
-                    _ if value.accepts(raw, pool) => v.take(raw),
+                    _ if value.accepts(raw, pool) => v.take(raw, at, n),
                     _ => {}
                 },
                 _ => {}

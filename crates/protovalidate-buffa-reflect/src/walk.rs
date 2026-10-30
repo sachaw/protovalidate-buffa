@@ -46,15 +46,18 @@ pub struct Walker<'a> {
     plans: &'a Plans,
     clock: Clock,
     depth: u32,
+    /// Slot buffers no message is using, one per nesting level reached.
+    pub spare: Vec<Vec<Found>>,
     pub violations: Vec<Violation>,
 }
 
 impl<'a> Walker<'a> {
-    pub fn new(plans: &'a Plans) -> Self {
+    pub fn new(plans: &'a Plans, spare: Vec<Vec<Found>>) -> Self {
         Self {
             plans,
             clock: Clock::default(),
             depth: 0,
+            spare,
             violations: Vec::new(),
         }
     }
@@ -69,7 +72,6 @@ impl<'a> Walker<'a> {
         msg: &Msg<'a>,
         path: Option<&Path<'_, 'a>>,
     ) -> Result<(), Abort> {
-        const INLINE: usize = 16;
         let plans = self.plans;
         let plan: &'a MessagePlan = &plans.messages[plan];
         if let Some(e) = &plan.error {
@@ -81,14 +83,9 @@ impl<'a> Walker<'a> {
         let pool = msg.pool;
 
         // One pass over the encoding finds the fields the plan reads.
-        let mut inline = [const { Found::EMPTY }; INLINE];
-        let mut heap = Vec::new();
-        let found: &mut [Found<'a>] = if plan.slots.len() <= INLINE {
-            &mut inline[..plan.slots.len()]
-        } else {
-            heap.resize(plan.slots.len(), Found::EMPTY);
-            &mut heap
-        };
+        let mut found = self.spare.pop().unwrap_or_default();
+        found.clear();
+        found.resize(plan.slots.len(), Found::EMPTY);
         if !plan.slots.is_empty() {
             msg.src
                 .visit_at(&mut |n, raw, at| {
@@ -103,14 +100,26 @@ impl<'a> Walker<'a> {
                             for &other in &slot.siblings {
                                 found[other].clear();
                             }
-                            found[s].take_at(raw, at);
+                            found[s].take(raw, at, n);
                         }
                     }
                     Ok::<(), Malformed>(())
                 })
                 .map_err(|_| Abort::Malformed)?;
         }
-        let found: &[Found<'a>] = found;
+        let result = self.fields(plan, msg, &found, path);
+        self.spare.push(found);
+        result
+    }
+
+    fn fields(
+        &mut self,
+        plan: &'a MessagePlan,
+        msg: &Msg<'a>,
+        found: &[Found],
+        path: Option<&Path<'_, 'a>>,
+    ) -> Result<(), Abort> {
+        let pool = msg.pool;
         let present = |s: usize| value::present(&found[s], &plan.slots[s].read, &msg.src, pool);
 
         if !plan.rules.is_empty() {
@@ -198,7 +207,7 @@ impl<'a> Walker<'a> {
             let read = &plan.slots[field.slot].read;
             let value = match read.shape.card {
                 Card::Singular => value::singular(&found[field.slot], &msg.src, read, pool),
-                _ => Msg::new(msg.src.within(&found[field.slot].span), msg.index, pool).read(read),
+                _ => Msg::new(msg.src.within(found[field.slot].span), msg.index, pool).read(read),
             };
             self.value(&field.value, &value, &here, false)?;
         }

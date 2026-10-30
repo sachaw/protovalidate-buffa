@@ -40,7 +40,7 @@ mod walk;
 mod wire;
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::HashMap,
     hash::{BuildHasherDefault, Hasher},
     sync::{
@@ -61,7 +61,7 @@ use crate::{
     cel::value::Msg,
     plan::{Builder, Plans},
     walk::{Abort, Walker},
-    wire::{Malformed, Src},
+    wire::{Found, Malformed, Src},
 };
 
 /// Validates messages against the rules in their descriptors.
@@ -78,12 +78,25 @@ pub struct Validator {
 }
 
 thread_local! {
+    static CACHE: RefCell<Cache> = const {
+        RefCell::new(Cache {
+            last: None,
+            buffer: Vec::new(),
+            spare: Vec::new(),
+        })
+    };
+}
+
+/// What a thread keeps between validations.
+struct Cache {
     /// The plans this thread last used, by validator id and descriptor
     /// address. Validating the same type again, the common case, then takes
     /// no lock.
-    static LAST: RefCell<Option<(u64, usize, Arc<Plans>)>> = const { RefCell::new(None) };
-    /// A buffer to encode messages into, kept between validations.
-    static BUFFER: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
+    last: Option<(u64, usize, Arc<Plans>)>,
+    /// A buffer to encode messages into.
+    buffer: Vec<u8>,
+    /// The walker's slot buffers.
+    spare: Vec<Vec<Found>>,
 }
 
 impl Default for Validator {
@@ -116,13 +129,16 @@ impl Validator {
         &self,
         message: &M,
     ) -> Result<(), ValidationError> {
-        let mut buffer = BUFFER.take();
-        buffer.clear();
-        message.encode(&mut buffer);
         let md = message.message_descriptor();
-        let result = self.with_plans(md, message.pool(), |plans| run(plans, &buffer));
-        BUFFER.set(buffer);
-        result.unwrap_or_else(|Malformed| Err(malformed(md)))
+        let encode = |buffer: &mut Vec<u8>| {
+            buffer.clear();
+            message.encode(buffer);
+        };
+        self.with_cache(md, message.pool(), |plans, scratch| {
+            encode(scratch.buffer);
+            run(plans, scratch.buffer, scratch.spare)
+        })
+        .unwrap_or_else(|Malformed| Err(malformed(md)))
     }
 
     /// Validates an encoded message of type `message` in `pool`, without
@@ -144,8 +160,8 @@ impl Validator {
         bytes: &[u8],
     ) -> Result<(), ValidationError> {
         let md = pool.message(message);
-        self.with_plans(md, pool, |plans| run(plans, bytes))
-            .unwrap_or_else(|Malformed| Err(malformed(md)))
+        self.with_cache(md, pool, |plans, scratch| run(plans, bytes, scratch.spare))
+        .unwrap_or_else(|Malformed| Err(malformed(md)))
     }
 
     /// [`validate_encoded`](Self::validate_encoded), telling bytes that do
@@ -157,30 +173,49 @@ impl Validator {
         message: MessageIndex,
         bytes: &[u8],
     ) -> Result<Result<(), ValidationError>, Malformed> {
-        self.with_plans(pool.message(message), pool, |plans| run(plans, bytes))
+        self.with_cache(pool.message(message), pool, |plans, scratch| {
+            run(plans, bytes, scratch.spare)
+        })
     }
 
-    fn with_plans<R>(
+    #[cfg(test)]
+    pub(crate) fn probe_cache(&self, md: &MessageDescriptor, pool: &Arc<DescriptorPool>) -> usize {
+        self.with_cache(md, pool, |p, _| p.messages.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn probe_run(&self, md: &MessageDescriptor, pool: &Arc<DescriptorPool>, b: &[u8]) -> bool {
+        self.with_cache(md, pool, |p, s| run(p, b, s.spare).is_ok())
+    }
+
+    /// Calls `f` with the plans for `md`, and the thread's buffers unless a
+    /// validation on this thread is already using them.
+    fn with_cache<R>(
         &self,
         md: &MessageDescriptor,
         pool: &Arc<DescriptorPool>,
-        f: impl FnOnce(&Plans) -> R,
+        f: impl FnOnce(&Plans, Scratch<'_>) -> R,
     ) -> R {
         let key = std::ptr::from_ref::<MessageDescriptor>(md) as usize;
-        LAST.with(|last| {
-            let plans = {
-                let Ok(cached) = last.try_borrow() else {
-                    return f(&self.plans(md, key, pool));
+        CACHE.with(|cache| {
+            let Ok(mut cache) = cache.try_borrow_mut() else {
+                let (mut buffer, mut spare) = (Vec::new(), Vec::new());
+                let scratch = Scratch {
+                    buffer: &mut buffer,
+                    spare: &mut spare,
                 };
-                match &*cached {
-                    Some((id, k, plans)) if *id == self.id && *k == key => return f(plans),
-                    _ => self.plans(md, key, pool),
-                }
+                return f(&self.plans(md, key, pool), scratch);
             };
-            if let Ok(mut cached) = last.try_borrow_mut() {
-                *cached = Some((self.id, key, Arc::clone(&plans)));
-            }
-            f(&plans)
+            let Cache {
+                last,
+                buffer,
+                spare,
+            } = &mut *cache;
+            let plans = match last {
+                Some((id, k, plans)) if *id == self.id && *k == key => plans,
+                _ => &*last.insert((self.id, key, self.plans(md, key, pool))).2,
+            };
+            f(plans, Scratch { buffer, spare })
         })
     }
 
@@ -205,10 +240,22 @@ impl Validator {
     }
 }
 
-fn run(plans: &Plans, bytes: &[u8]) -> Result<Result<(), ValidationError>, Malformed> {
-    let mut walker = Walker::new(plans);
+/// The thread's buffers, lent to one validation.
+struct Scratch<'c> {
+    buffer: &'c mut Vec<u8>,
+    spare: &'c mut Vec<Vec<Found>>,
+}
+
+fn run(
+    plans: &Plans,
+    bytes: &[u8],
+    spare: &mut Vec<Vec<Found>>,
+) -> Result<Result<(), ValidationError>, Malformed> {
+    let mut walker = Walker::new(plans, std::mem::take(spare));
     let root = Msg::new(Src::Bytes(bytes), plans.root, &plans.pool);
-    Ok(match walker.root(&root) {
+    let result = walker.root(&root);
+    *spare = std::mem::take(&mut walker.spare);
+    Ok(match result {
         Ok(()) if walker.violations.is_empty() => Ok(()),
         Ok(()) => Err(ValidationError {
             violations: walker.violations,

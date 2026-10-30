@@ -64,7 +64,7 @@ pub struct Msg<'a> {
 /// The fields a walk found in one pass over a message, by slot.
 pub struct Gathered<'a> {
     pub dispatch: &'a Dispatch,
-    pub found: &'a [Found<'a>],
+    pub found: &'a [Found],
 }
 
 /// A list.
@@ -214,7 +214,7 @@ impl<'a> Msg<'a> {
         }
     }
 
-    fn gathered(&self, number: u32) -> Option<&'a Found<'a>> {
+    fn gathered(&self, number: u32) -> Option<&'a Found> {
         let g = self.gathered?;
         g.dispatch.get(number).map(|s| &g.found[s])
     }
@@ -258,7 +258,7 @@ impl<'a> Msg<'a> {
             };
         }
         let field = Field {
-            src: gathered.map_or_else(|| self.src.clone(), |f| self.src.within(&f.span)),
+            src: gathered.map_or_else(|| self.src.clone(), |f| self.src.within(f.span)),
             number: shape.number,
             kind: shape.kind,
             card: shape.card,
@@ -325,15 +325,16 @@ fn scan_has(src: &Src<'_>, read: &Read, pool: &Arc<DescriptorPool>) -> bool {
 
 /// Whether a field is set: present on the wire, and, without explicit
 /// presence, set to other than its zero value; a list or map, not empty.
-pub fn present(found: &Found<'_>, read: &Read, src: &Src<'_>, pool: &Arc<DescriptorPool>) -> bool {
-    match (read.shape.card, found.last) {
+#[inline]
+pub fn present(found: &Found, read: &Read, src: &Src<'_>, pool: &Arc<DescriptorPool>) -> bool {
+    match (read.shape.card, found.last(src)) {
         (_, None) => false,
         (Card::Singular, Some(_)) if read.shape.explicit => true,
         // A closed enum drops the values it does not declare, which may be
         // all of them.
         (Card::List | Card::Map(_), Some(_)) => {
             !matches!(read.shape.kind, Kind::Enum(Some(_)))
-                || scan_has(&src.within(&found.span), read, pool)
+                || scan_has(&src.within(found.span), read, pool)
         }
         (Card::Singular, Some(raw)) => match read.shape.kind {
             Kind::Scalar(s) => !is_zero_scalar(&scalar(raw, s)),
@@ -358,12 +359,12 @@ fn is_zero_scalar(v: &Value<'_>) -> bool {
 /// A singular field's value: its last occurrence, its occurrences merged,
 /// or its default.
 pub fn singular<'a>(
-    found: &Found<'a>,
+    found: &Found,
     parent: &Src<'a>,
     read: &Read,
     pool: &'a Arc<DescriptorPool>,
 ) -> Value<'a> {
-    match (read.shape.kind, found.last) {
+    match (read.shape.kind, found.last(parent)) {
         (Kind::Message(m), Some(_)) => message_as(
             Msg::new(found.message(parent, read.shape.number), m, pool),
             read.wkt,
@@ -400,6 +401,7 @@ pub fn element<'a>(
 /// A scalar occurrence's value.
 #[expect(clippy::cast_possible_truncation, reason = "the wire's truncations")]
 #[expect(clippy::cast_possible_wrap, reason = "the wire's reinterpretations")]
+#[inline]
 pub fn scalar(raw: Raw<'_>, s: ScalarType) -> Value<'_> {
     match (s, raw) {
         (ScalarType::Int32, Raw::Varint(v)) => Value::Int(i64::from(v as i32)),
