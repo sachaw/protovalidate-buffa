@@ -34,6 +34,8 @@
 //! [Protovalidate]: https://protovalidate.com
 //! [`cel`]: https://docs.rs/cel
 
+#![forbid(unsafe_code)]
+
 mod cel;
 #[cfg(feature = "connect")]
 mod connect;
