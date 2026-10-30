@@ -8,10 +8,10 @@ use protovalidate_buffa::{FieldPath, FieldPathElement, FieldType, Subscript, Vio
 use crate::{
     cel::{
         Clock, Outcome,
-        value::{self, Gathered, List, Map, Msg, Prim, Value},
+        value::{self, Gathered, List, Map, Msg, Prim, Read, Value, Wkt},
     },
     plan::{Check, Elem, FieldPlan, MessagePlan, Op, Plans, Route, Rule, ValuePlan},
-    wire::{self, Card, Found, Malformed, Raw},
+    wire::{self, Card, Found, Kind, Malformed, Raw},
 };
 
 /// Why a validation stopped before it finished.
@@ -69,6 +69,178 @@ impl<'a> Walker<'a> {
         self.message(0, msg, None)
     }
 
+    /// Whether a quick pass finds the message valid, reading only scalars
+    /// off the wire and building no path. False when it is not, or when the
+    /// pass does not cover it: the walk then decides, and reports.
+    pub fn quick(&mut self, plan: usize, msg: &Msg<'a>) -> bool {
+        let plans = self.plans;
+        let plan: &'a MessagePlan = &plans.messages[plan];
+        if !plan.quick || self.depth >= wire::DEPTH {
+            return false;
+        }
+        let base = self.found.len();
+        let ok = self.gather(plan, msg, base).is_ok() && self.quick_fields(plan, msg, base);
+        self.found.truncate(base);
+        ok
+    }
+
+    fn quick_fields(&mut self, plan: &'a MessagePlan, msg: &Msg<'a>, base: usize) -> bool {
+        let pool = msg.pool;
+        if !plan
+            .oneofs
+            .iter()
+            .all(|(members, _)| members.iter().any(|&s| self.found[base + s].last.is_some()))
+        {
+            return false;
+        }
+        for field in &plan.fields {
+            let found = self.found[base + field.slot];
+            let read = &plan.slots[field.slot].read;
+            let p = match field.op {
+                Op::Prim(s, _) => Some(
+                    found
+                        .last(&msg.src)
+                        .map_or_else(|| value::zero(s), |raw| value::prim(raw, s)),
+                ),
+                _ => None,
+            };
+            let present = match (field.op, p) {
+                (Op::Prim(_, explicit), Some(p)) => {
+                    found.last.is_some() && (explicit || !p.is_zero())
+                }
+                (Op::Time(_) | Op::Message(..), _) => found.last.is_some(),
+                _ => value::present(&found, read, &msg.src, pool),
+            };
+            if !present {
+                if field.required {
+                    return false;
+                }
+                if field.skip_unset {
+                    continue;
+                }
+            }
+            let ok = match (field.op, p) {
+                (Op::Prim(..), Some(p)) => self.prim_ok(&field.value, p),
+                (Op::Time(w), _) => value::time(&found.message(&msg.src, read.shape.number), w)
+                    .is_some_and(|p| self.prim_ok(&field.value, p)),
+                (Op::Message(child, index), _) => {
+                    let src = found.message(&msg.src, read.shape.number);
+                    self.depth += 1;
+                    let ok = self.quick(child, &Msg::new(src, index, pool));
+                    self.depth -= 1;
+                    ok
+                }
+                _ => self.quick_value(field, read, &found, msg),
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// [`quick_fields`](Self::quick_fields), for a field read as a value:
+    /// a repeated field or map with scalar checks, a wrapper, or an `Any`.
+    fn quick_value(
+        &self,
+        field: &'a FieldPlan,
+        read: &Read,
+        found: &Found,
+        msg: &Msg<'a>,
+    ) -> bool {
+        let (v, pool) = (&field.value, msg.pool);
+        match (read.shape.card, read.shape.kind) {
+            (Card::List | Card::Map(_), _) => {
+                let value = Msg::new(msg.src.within(found.span), msg.index, pool).read(read);
+                let mut ok = true;
+                let handled = match (&value, &v.items, &v.entries) {
+                    (Value::List(list), Some(items), _) => list.prims(&mut |p| {
+                        ok = self.prim_ok(items, p);
+                        ok
+                    }),
+                    (Value::Map(map), _, Some(entries)) => map.prims(&mut |k, p| {
+                        ok = self.prim_ok(&entries.0, k) && self.prim_ok(&entries.1, p);
+                        ok
+                    }),
+                    _ => false,
+                };
+                handled && ok
+            }
+            (Card::Singular, Kind::Message(m)) => {
+                let src = found.message(&msg.src, read.shape.number);
+                match read.wkt {
+                    Some(Wkt::Wrapper) => value::wrapped_prim(&src, pool.message(m), pool)
+                        .is_some_and(|p| self.prim_ok(v, p)),
+                    Some(Wkt::Any) => v.checks.iter().all(|c| match c {
+                        Check::AnyIn { url, urls, not, .. } => {
+                            let m = Msg::new(src.clone(), m, pool);
+                            let Prim::Str(url) = m.prim(url, ScalarType::String) else {
+                                return false;
+                            };
+                            urls.iter().any(|u| **u == *url) != *not
+                        }
+                        _ => false,
+                    }),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether every check of a scalar plan passes.
+    fn prim_ok(&self, plan: &ValuePlan, p: Prim<'_>) -> bool {
+        if plan.ignore_zero && p.is_zero() {
+            return true;
+        }
+        plan.checks.iter().all(|check| match check {
+            Check::Rule(rule) => rule.program.passes_prim(p, &self.clock) == Some(true),
+            Check::DefinedEnum { values, .. } => match p {
+                Prim::Int(n) => i32::try_from(n).is_ok_and(|n| values.binary_search(&n).is_ok()),
+                _ => false,
+            },
+            Check::AnyIn { .. } => false,
+        })
+    }
+
+    /// Finds the fields the plan reads in one pass over the encoding, into
+    /// slots from `base`.
+    fn gather(
+        &mut self,
+        plan: &'a MessagePlan,
+        msg: &Msg<'a>,
+        base: usize,
+    ) -> Result<(), Malformed> {
+        let pool = msg.pool;
+        self.found.resize(base + plan.slots.len(), Found::EMPTY);
+        if plan.slots.is_empty() {
+            return Ok(());
+        }
+        let found = &mut self.found[base..];
+        msg.src.visit_at(&mut |n, raw, at| {
+            let Some(route) = plan.dispatch.route(n) else {
+                return Ok(());
+            };
+            if route.wires & raw.wire() == 0 {
+                return Ok(());
+            }
+            let s = usize::from(route.slot);
+            if route.flags != 0 {
+                let slot = &plan.slots[s];
+                if route.flags & Route::CLOSED != 0 && !slot.read.shape.accepts(raw, pool)
+                    || route.flags & Route::PACKED != 0 && matches!(raw, Raw::Len([]))
+                {
+                    return Ok(());
+                }
+                for &other in &slot.siblings {
+                    found[other].clear();
+                }
+            }
+            found[s].take(raw, at, n);
+            Ok::<(), Malformed>(())
+        })
+    }
+
     fn message(
         &mut self,
         plan: usize,
@@ -83,38 +255,10 @@ impl<'a> Walker<'a> {
         if self.depth >= wire::DEPTH {
             return Err(Box::new(Abort::Malformed));
         }
-        let pool = msg.pool;
 
-        // One pass over the encoding finds the fields the plan reads.
         let base = self.found.len();
-        self.found.resize(base + plan.slots.len(), Found::EMPTY);
-        if !plan.slots.is_empty() {
-            let found = &mut self.found[base..];
-            msg.src
-                .visit_at(&mut |n, raw, at| {
-                    let Some(route) = plan.dispatch.route(n) else {
-                        return Ok(());
-                    };
-                    if route.wires & raw.wire() == 0 {
-                        return Ok(());
-                    }
-                    let s = usize::from(route.slot);
-                    if route.flags != 0 {
-                        let slot = &plan.slots[s];
-                        if route.flags & Route::CLOSED != 0 && !slot.read.shape.accepts(raw, pool)
-                            || route.flags & Route::PACKED != 0 && matches!(raw, Raw::Len([]))
-                        {
-                            return Ok(());
-                        }
-                        for &other in &slot.siblings {
-                            found[other].clear();
-                        }
-                    }
-                    found[s].take(raw, at, n);
-                    Ok::<(), Malformed>(())
-                })
-                .map_err(|_| Box::new(Abort::Malformed))?;
-        }
+        self.gather(plan, msg, base)
+            .map_err(|_| Box::new(Abort::Malformed))?;
         let result = self.fields(plan, msg, base, path);
         self.found.truncate(base);
         result

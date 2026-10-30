@@ -630,6 +630,21 @@ pub fn message_as(m: Msg<'_>, w: Option<Wkt>) -> Value<'_> {
 }
 
 /// A wrapper's `value = 1`.
+/// A set wrapper's value, as the scalar read off the wire.
+pub fn wrapped_prim<'a>(
+    src: &Src<'a>,
+    md: &MessageDescriptor,
+    pool: &DescriptorPool,
+) -> Option<Prim<'a>> {
+    let Some(FieldKind::Singular(SingularKind::Scalar(s))) =
+        md.fields().first().map(FieldDescriptor::kind)
+    else {
+        return None;
+    };
+    let found = wire::singular(src, &Shape::entry(1, Kind::Scalar(s)), pool).ok()?;
+    Some(found.last(src).map_or_else(|| zero(s), |raw| prim(raw, s)))
+}
+
 fn wrapped<'a>(m: &Msg<'a>) -> Value<'a> {
     let Some(FieldKind::Singular(SingularKind::Scalar(s))) =
         m.descriptor().fields().first().map(FieldDescriptor::kind)

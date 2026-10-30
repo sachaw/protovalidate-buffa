@@ -152,7 +152,7 @@ impl Program {
                 let held = match check
                     .typed
                     .as_ref()
-                    .and_then(|test| test(typed::Arg::Value(this), clock))
+                    .and_then(|test| test(&typed::Arg::Value(this), clock))
                 {
                     Some(held) => held,
                     None => check.pred.eval(this, clock).map_err(Box::new)?,
@@ -175,7 +175,7 @@ impl Program {
         };
         match (&check.typed, check.scalar) {
             (Some(test), true) => {
-                test(typed::Arg::Prim(this), clock).map(|held| held != check.fails_when)
+                test(&typed::Arg::Prim(this), clock).map(|held| held != check.fails_when)
             }
             _ => None,
         }
@@ -197,7 +197,7 @@ impl Program {
                 let held = match check
                     .typed
                     .as_ref()
-                    .and_then(|test| test(typed::Arg::Value(this), clock))
+                    .and_then(|test| test(&typed::Arg::Value(this), clock))
                 {
                     Some(held) => held,
                     None => check.pred.eval(this, clock)?,

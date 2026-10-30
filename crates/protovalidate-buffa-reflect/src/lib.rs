@@ -47,7 +47,7 @@ mod walk;
 mod wire;
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     hash::{BuildHasherDefault, Hasher},
     sync::{
@@ -193,6 +193,16 @@ impl Validator {
             .map_err(|f| (*f).into_error(md))
     }
 
+    /// The plan for `message`, which validates its encodings with no lookup:
+    /// for a caller that validates one type again and again, as a server
+    /// does each method's requests.
+    #[must_use]
+    pub fn plan(&self, pool: &Arc<DescriptorPool>, message: MessageIndex) -> Plan {
+        let md = pool.message(message);
+        let key = std::ptr::from_ref::<MessageDescriptor>(md) as usize;
+        Plan(self.plans(md, key, pool))
+    }
+
     /// The standard rules of `message`'s type, and the types it holds, that
     /// do not run as native checks: for testing that every one does.
     #[doc(hidden)]
@@ -203,20 +213,6 @@ impl Validator {
     ) -> Vec<Box<str>> {
         self.with_cache(pool.message(message), pool, |plans, _| {
             plans.interpreted.clone()
-        })
-    }
-
-    /// [`validate_encoded`](Self::validate_encoded), telling bytes that do
-    /// not decode apart.
-    #[cfg(feature = "connect")]
-    fn validate_wire(
-        &self,
-        pool: &Arc<DescriptorPool>,
-        message: MessageIndex,
-        bytes: &[u8],
-    ) -> Result<(), Box<Failure>> {
-        self.with_cache(pool.message(message), pool, |plans, scratch| {
-            run(plans, bytes, scratch.spare)
         })
     }
 
@@ -272,6 +268,35 @@ impl Validator {
     }
 }
 
+/// The compiled rules of one message type, from [`Validator::plan`].
+#[derive(Clone)]
+pub struct Plan(Arc<Plans>);
+
+thread_local! {
+    /// The walker's slot stack, kept between validations by plan.
+    static SLOTS: Cell<Vec<Found>> = const { Cell::new(Vec::new()) };
+}
+
+impl Plan {
+    /// Validates an encoded message of the plan's type, as
+    /// [`Validator::validate_encoded`] does.
+    ///
+    /// # Errors
+    ///
+    /// As [`Validator::validate`].
+    pub fn validate(&self, bytes: &[u8]) -> Result<(), ValidationError> {
+        self.run(bytes)
+            .map_err(|f| (*f).into_error(self.0.pool.message(self.0.root)))
+    }
+
+    fn run(&self, bytes: &[u8]) -> Result<(), Box<Failure>> {
+        let mut slots = SLOTS.take();
+        let result = run(&self.0, bytes, &mut slots);
+        SLOTS.set(slots);
+        result
+    }
+}
+
 /// The thread's buffers, lent to one validation.
 struct Scratch<'c> {
     buffer: &'c mut Vec<u8>,
@@ -300,6 +325,12 @@ impl Failure {
 fn run(plans: &Plans, bytes: &[u8], spare: &mut Vec<Found>) -> Result<(), Box<Failure>> {
     let mut walker = Walker::new(plans, std::mem::take(spare));
     let root = Msg::new(Src::Bytes(bytes), plans.root, &plans.pool);
+    // A valid message passes the quick pass; anything else is walked, and
+    // what the walk finds reported.
+    if walker.quick(0, &root) {
+        *spare = std::mem::take(&mut walker.found);
+        return Ok(());
+    }
     let result = walker.root(&root);
     *spare = std::mem::take(&mut walker.found);
     let error = match result.map_err(|abort| *abort) {

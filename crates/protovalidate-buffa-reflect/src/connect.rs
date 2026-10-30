@@ -15,7 +15,7 @@ use connectrpc::{
 };
 use futures_util::StreamExt as _;
 
-use crate::{Failure, Validator};
+use crate::{Failure, Plan, Validator};
 
 impl Validator {
     /// Validates a request in a handler, as an `invalid_argument` error
@@ -50,28 +50,30 @@ pub struct ValidateInterceptor(Arc<Inner>);
 
 struct Inner {
     pool: Arc<DescriptorPool>,
-    /// Each method's input type, by procedure path (`/pkg.Service/Method`).
-    inputs: HashMap<String, MessageIndex>,
-    validator: Validator,
+    /// Each method's input type and its plan, by procedure path
+    /// (`/pkg.Service/Method`), resolved once.
+    inputs: HashMap<String, (MessageIndex, Plan)>,
 }
 
 impl ValidateInterceptor {
     #[must_use]
     pub fn new(pool: Arc<DescriptorPool>) -> Self {
+        let validator = Validator::new();
         let inputs = pool
             .services()
             .iter()
             .flat_map(|s| {
-                s.methods()
-                    .iter()
-                    .map(move |m| (format!("/{}/{}", s.full_name(), m.name()), m.input()))
+                let (pool, validator) = (&pool, &validator);
+                s.methods().iter().map(move |m| {
+                    let plan = validator.plan(pool, m.input());
+                    (
+                        format!("/{}/{}", s.full_name(), m.name()),
+                        (m.input(), plan),
+                    )
+                })
             })
             .collect();
-        Self(Arc::new(Inner {
-            pool,
-            inputs,
-            validator: Validator::new(),
-        }))
+        Self(Arc::new(Inner { pool, inputs }))
     }
 }
 
@@ -84,26 +86,28 @@ impl ValidateInterceptor {
     /// The request is invalid, or its rules cannot be evaluated.
     pub fn check(&self, procedure: &str, payload: &Payload) -> Result<(), ConnectError> {
         match self.0.inputs.get(procedure) {
-            Some(&input) => self.0.check(input, payload),
+            Some((input, plan)) => self.0.check(*input, plan, payload),
             None => Ok(()),
         }
     }
 }
 
 impl Inner {
-    fn check(&self, input: MessageIndex, payload: &Payload) -> Result<(), ConnectError> {
+    fn check(
+        &self,
+        input: MessageIndex,
+        plan: &Plan,
+        payload: &Payload,
+    ) -> Result<(), ConnectError> {
         let Ok(bytes) = payload.encoded() else {
             return Ok(());
         };
         let result = match payload.format() {
-            CodecFormat::Proto => self.validator.validate_wire(&self.pool, input, &bytes),
+            CodecFormat::Proto => plan.run(&bytes),
             CodecFormat::Json => match std::str::from_utf8(&bytes).ok().and_then(|json| {
                 DynamicMessage::from_json(Arc::clone(&self.pool), input, json).ok()
             }) {
-                Some(message) => {
-                    self.validator
-                        .validate_wire(&self.pool, input, &message.encode_to_vec())
-                }
+                Some(message) => plan.run(&message.encode_to_vec()),
                 None => return Ok(()),
             },
             _ => return Ok(()),
@@ -137,13 +141,14 @@ impl Interceptor for ValidateInterceptor {
         inbound: PayloadStream,
         next: NextStream<'_>,
     ) -> Result<StreamResponse, ConnectError> {
-        let Some(&input) = req.ctx.path().and_then(|p| self.0.inputs.get(p)) else {
+        let Some((input, plan)) = req.ctx.path().and_then(|p| self.0.inputs.get(p)) else {
             return next.run(req, inbound).await;
         };
+        let (input, plan) = (*input, plan.clone());
         let inner = Arc::clone(&self.0);
         let inbound: PayloadStream = Box::pin(inbound.map(move |payload| {
             let payload = payload?;
-            inner.check(input, &payload)?;
+            inner.check(input, &plan, &payload)?;
             Ok(payload)
         }));
         next.run(req, inbound).await

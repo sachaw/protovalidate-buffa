@@ -40,14 +40,14 @@ pub enum Arg<'v, 'a> {
 
 /// A compiled test of `this`: `None` when the value is not of the type it
 /// was compiled for.
-pub type Test = Box<dyn for<'v, 'a> Fn(Arg<'v, 'a>, &Clock) -> Option<bool> + Send + Sync>;
+pub type Test = Box<dyn for<'v, 'a> Fn(&Arg<'v, 'a>, &Clock) -> Option<bool> + Send + Sync>;
 
-type Get<T> = Box<dyn for<'v, 'a> Fn(Arg<'v, 'a>, &Clock) -> Option<T> + Send + Sync>;
-type GetStr = Box<dyn for<'v, 'a> Fn(Arg<'v, 'a>, &Clock) -> Option<Str<'a>> + Send + Sync>;
-type GetBytes = Box<dyn for<'v, 'a> Fn(Arg<'v, 'a>, &Clock) -> Option<Bin<'a>> + Send + Sync>;
-type GetPrim = Box<dyn for<'v, 'a> Fn(Arg<'v, 'a>, &Clock) -> Option<Prim<'a>> + Send + Sync>;
-type GetValue = Box<dyn for<'v, 'a> Fn(Arg<'v, 'a>, &Clock) -> Option<Value<'a>> + Send + Sync>;
-type GetMsg = Box<dyn for<'v, 'a> Fn(Arg<'v, 'a>, &Clock) -> Option<Msg<'a>> + Send + Sync>;
+type Get<T> = Box<dyn for<'v, 'a> Fn(&Arg<'v, 'a>, &Clock) -> Option<T> + Send + Sync>;
+type GetStr = Box<dyn for<'v, 'a> Fn(&Arg<'v, 'a>, &Clock) -> Option<Str<'a>> + Send + Sync>;
+type GetBytes = Box<dyn for<'v, 'a> Fn(&Arg<'v, 'a>, &Clock) -> Option<Bin<'a>> + Send + Sync>;
+type GetPrim = Box<dyn for<'v, 'a> Fn(&Arg<'v, 'a>, &Clock) -> Option<Prim<'a>> + Send + Sync>;
+type GetValue = Box<dyn for<'v, 'a> Fn(&Arg<'v, 'a>, &Clock) -> Option<Value<'a>> + Send + Sync>;
+type GetMsg = Box<dyn for<'v, 'a> Fn(&Arg<'v, 'a>, &Clock) -> Option<Msg<'a>> + Send + Sync>;
 
 /// What an operand holds.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -273,7 +273,7 @@ pub fn compile(p: &Pred, this: &Ty) -> Option<Test> {
                     return None;
                 };
                 let mut out = Some(all);
-                items.for_each(&mut |item| match body(Arg::Value(&item), c) {
+                items.for_each(&mut |item| match body(&Arg::Value(&item), c) {
                     Some(b) if b != all => {
                         out = Some(!all);
                         false
@@ -323,16 +323,17 @@ fn against<T: PartialOrd + Copy + Send + Sync + 'static>(
     x: &Operand,
     op: Op,
     k: T,
-    conv: fn(Prim<'_>) -> Option<T>,
+    conv: impl Fn(Prim<'_>) -> Option<T> + Copy + Send + Sync + 'static,
 ) -> Option<Test> {
     if let (Base::This, [], Conv::None) = (x.base, &*x.path, x.conv) {
         return Some(Box::new(move |v, _| {
-            Some(decide(op, conv(this_prim(v)?)?.partial_cmp(&k)))
+            Some(decide(op, conv(this_prim(*v)?)?.partial_cmp(&k)))
         }));
     }
     Some(ordered(read(x, conv)?, op, k))
 }
 
+#[inline]
 const fn as_int(p: Prim<'_>) -> Option<i64> {
     match p {
         Prim::Int(i) => Some(i),
@@ -340,6 +341,7 @@ const fn as_int(p: Prim<'_>) -> Option<i64> {
     }
 }
 
+#[inline]
 const fn as_uint(p: Prim<'_>) -> Option<u64> {
     match p {
         Prim::Uint(u) => Some(u),
@@ -347,6 +349,7 @@ const fn as_uint(p: Prim<'_>) -> Option<u64> {
     }
 }
 
+#[inline]
 const fn as_double(p: Prim<'_>) -> Option<f64> {
     match p {
         Prim::Double(d) => Some(d),
@@ -354,6 +357,7 @@ const fn as_double(p: Prim<'_>) -> Option<f64> {
     }
 }
 
+#[inline]
 const fn as_bool(p: Prim<'_>) -> Option<bool> {
     match p {
         Prim::Bool(b) => Some(b),
@@ -513,7 +517,7 @@ fn message(path: &[Read]) -> Option<GetMsg> {
         })
         .collect::<Option<_>>()?;
     Some(Box::new(move |v, _| {
-        let Arg::Value(Value::Message(m)) = v else {
+        let Arg::Value(Value::Message(m)) = *v else {
             return None;
         };
         let Some(((first, index), rest)) = path.split_first() else {
@@ -535,7 +539,7 @@ fn value(x: &Operand) -> Option<GetValue> {
         }));
     }
     let Some((last, path)) = x.path.split_last() else {
-        return Some(Box::new(|v, _| match v {
+        return Some(Box::new(|v, _| match *v {
             Arg::Prim(p) => Some(p.value()),
             Arg::Value(v) => Some(v.clone()),
         }));
@@ -554,12 +558,12 @@ fn read<T: 'static>(
         return None;
     }
     let Some((last, path)) = x.path.split_last() else {
-        return Some(Box::new(move |v, _| conv(this_prim(v)?)));
+        return Some(Box::new(move |v, _| conv(this_prim(*v)?)));
     };
     let s = scalar(last)?;
     let last = last.clone();
     if path.is_empty() {
-        return Some(Box::new(move |v, _| match v {
+        return Some(Box::new(move |v, _| match *v {
             Arg::Value(Value::Message(m)) => conv(m.prim(&last, s)),
             _ => None,
         }));
@@ -568,6 +572,7 @@ fn read<T: 'static>(
     Some(Box::new(move |v, c| conv(get(v, c)?.prim(&last, s))))
 }
 
+#[inline]
 const fn this_prim<'a>(v: Arg<'_, 'a>) -> Option<Prim<'a>> {
     let v = match v {
         Arg::Prim(p) => return Some(p),
@@ -619,7 +624,7 @@ fn nanos(s: i64, n: i64) -> i128 {
 /// Reads a `Duration` operand, in nanoseconds.
 fn duration(x: &Operand) -> Option<Get<i128>> {
     if let (Base::This, [], Conv::None) = (x.base, &*x.path, x.conv) {
-        return Some(Box::new(|v, _| match v {
+        return Some(Box::new(|v, _| match *v {
             Arg::Prim(Prim::Duration(s, n)) => Some(nanos(s, i64::from(n))),
             Arg::Value(Value::Duration(d)) => Some(span(*d)),
             _ => None,
@@ -635,7 +640,7 @@ fn duration(x: &Operand) -> Option<Get<i128>> {
 /// Reads a `Timestamp` operand, in nanoseconds since the epoch.
 fn timestamp(x: &Operand) -> Option<Get<i128>> {
     if let (Base::This, [], Conv::None) = (x.base, &*x.path, x.conv) {
-        return Some(Box::new(|v, _| match v {
+        return Some(Box::new(|v, _| match *v {
             Arg::Prim(Prim::Timestamp(s, n)) => Some(nanos(s, i64::from(n))),
             Arg::Value(Value::Timestamp(t)) => instant(*t),
             _ => None,
@@ -676,7 +681,7 @@ fn text_or_bytes(x: &Operand) -> Option<GetPrim> {
         return None;
     }
     let Some((last, path)) = x.path.split_last() else {
-        return Some(Box::new(|v, _| match v {
+        return Some(Box::new(|v, _| match *v {
             Arg::Prim(p) => Some(p),
             Arg::Value(Value::String(Str::Ref(s))) => Some(Prim::Str(s)),
             Arg::Value(Value::Bytes(Bin::Ref(b))) => Some(Prim::Bytes(b)),

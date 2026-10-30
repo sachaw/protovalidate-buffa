@@ -126,9 +126,8 @@ where
     });
     let view = OwnedView::<M::View<'static>>::decode(Bytes::from(bytes.clone())).expect("decodes");
     let viewed = measure(|| black_box(validator.validate_view(black_box(&view))).expect("valid"));
-    let encoded = measure(|| {
-        black_box(validator.validate_encoded(pool, idx, black_box(&bytes))).expect("valid");
-    });
+    let plan = validator.plan(pool, idx);
+    let encoded = measure(|| black_box(plan.validate(black_box(&bytes))).expect("valid"));
     println!(
         "{name:<29} {:>4} B | message: generated {:>5.0} ns, encode+validate {:>5.0} ns ({:>4.1}x), view {:>5.0} ns | encoded: decode+generated {:>5.0} ns {:>4.1} alloc, validate {:>5.0} ns {:>3.1} alloc ({:>4.2}x)",
         bytes.len(),
