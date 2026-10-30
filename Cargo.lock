@@ -239,6 +239,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b15b05c8418f1e200e406e5b19df97400dffa833e2450e4392c506896cbc97ac"
 dependencies = [
  "buffa",
+ "buffa-descriptor",
  "bytes",
  "jiff",
  "serde",
@@ -1125,7 +1126,11 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "buffa",
+ "buffa-build",
+ "buffa-codegen",
  "buffa-descriptor",
+ "buffa-types",
+ "protoc-gen-protovalidate-buffa",
  "protovalidate-buffa",
  "protovalidate-buffa-reflect",
 ]

@@ -1,0 +1,154 @@
+//! The reflection validator against the plugin's generated validators, on the
+//! same conformance messages: time and heap allocations per validation of a
+//! valid message.
+//!
+//! `cargo bench -p protovalidate-buffa-reflect-conformance`
+
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    hint::black_box,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
+    time::Instant,
+};
+
+use buffa::Message;
+use buffa_descriptor::reflect::{DynamicMessage, ReflectMessage};
+use protovalidate_buffa::Validate;
+use protovalidate_buffa_reflect::Validator;
+use protovalidate_buffa_reflect_conformance::cases::buf::validate::conformance::cases::{
+    self as c, custom_rules as cr,
+};
+
+struct Counting;
+static ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+// SAFETY: forwards to the system allocator, counting calls.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        ALLOCS.fetch_add(1, Relaxed);
+        // SAFETY: as the caller's.
+        unsafe { System.alloc(l) }
+    }
+
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        // SAFETY: as the caller's.
+        unsafe { System.dealloc(p, l) }
+    }
+
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+        ALLOCS.fetch_add(1, Relaxed);
+        // SAFETY: as the caller's.
+        unsafe { System.realloc(p, l, n) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: Counting = Counting;
+
+/// Best of seven runs: nanoseconds and allocations per call.
+fn measure(mut f: impl FnMut()) -> (f64, f64) {
+    for _ in 0..20_000 {
+        f();
+    }
+    let mut best = (f64::MAX, 0.0);
+    for _ in 0..7 {
+        let n = 200_000u32;
+        let a0 = ALLOCS.load(Relaxed);
+        let t = Instant::now();
+        for _ in 0..n {
+            f();
+        }
+        let ns = t.elapsed().as_secs_f64() * 1e9 / f64::from(n);
+        #[expect(clippy::cast_precision_loss, reason = "a count of allocations")]
+        let allocs = (ALLOCS.load(Relaxed) - a0) as f64 / f64::from(n);
+        if ns < best.0 {
+            best = (ns, allocs);
+        }
+    }
+    best
+}
+
+fn bench<M>(name: &str, json: &str)
+where
+    M: Message + ReflectMessage + Validate + Default,
+{
+    let pool = c::__buffa::reflect::descriptor_pool();
+    let template = M::default();
+    let idx = pool
+        .message_index(template.message_descriptor().full_name())
+        .expect("a case type");
+    let dynamic = DynamicMessage::from_json(Arc::clone(pool), idx, json).expect("valid JSON");
+    let bytes = dynamic.encode_to_vec();
+    let typed = M::decode_from_slice(&bytes).expect("decodes");
+    let validator = Validator::new();
+    assert!(
+        typed.validate().is_ok(),
+        "{name}: the generated validator rejects the input"
+    );
+    assert!(
+        validator.validate(&typed).is_ok(),
+        "{name}: the reflection validator rejects the input: {:?}",
+        validator.validate(&typed)
+    );
+
+    let generated = measure(|| black_box(black_box(&typed).validate()).expect("valid"));
+    let reflected = measure(|| black_box(validator.validate(black_box(&typed))).expect("valid"));
+    let dynamic = measure(|| black_box(validator.validate(black_box(&dynamic))).expect("valid"));
+    let decode = measure(|| {
+        black_box(M::decode_from_slice(black_box(&bytes)).expect("decodes"));
+    });
+    println!(
+        "{name:<22} {:>5} B | generated {:>7.0} ns {:>4.1} alloc | reflect {:>7.0} ns {:>4.1} alloc ({:>4.1}x) | reflect, dynamic message {:>7.0} ns | decode {:>6.0} ns",
+        bytes.len(),
+        generated.0,
+        generated.1,
+        reflected.0,
+        reflected.1,
+        reflected.0 / generated.0,
+        dynamic.0,
+        decode.0,
+    );
+}
+
+fn main() {
+    let complex = r#"{
+        "const": "abcd", "intConst": 5, "boolConst": false, "floatVal": 1.5,
+        "durVal": "3s", "tsVal": "1970-01-01T00:00:08Z", "floatConst": 7,
+        "doubleIn": 123, "enumConst": 2,
+        "anyVal": {"@type": "type.googleapis.com/google.protobuf.Duration", "value": "1s"},
+        "repTsVal": ["1970-01-01T00:00:01Z", "1970-01-01T00:00:02Z"],
+        "mapVal": {"-1": "a", "-2": "b"}, "bytesVal": "AJk=", "x": "x"
+    }"#;
+    let kitchen_sink = format!(
+        r#"{{"val": {{ {}, "nested": {complex}, "another": {complex} }} }}"#,
+        complex.trim().trim_start_matches('{').trim_end_matches('}')
+    );
+    println!("valid messages; best of 7 runs of 200k validations");
+    bench::<c::KitchenSinkMessage>("KitchenSinkMessage", &kitchen_sink);
+    bench::<cr::MessageExpressions>(
+        "MessageExpressions",
+        r#"{"a": 1, "b": 2, "c": 0, "d": 1, "e": {"a": 3, "b": 2}, "f": {"a": 3, "b": 1}}"#,
+    );
+    bench::<cr::FieldExpressionMultipleScalar>("FieldExpressionMultipleScalar", r#"{"val": 3}"#);
+    bench::<c::StringEmail>("StringEmail", r#"{"val": "someone@example.com"}"#);
+    bench::<c::StringPattern>("StringPattern", r#"{"val": "abc123"}"#);
+    bench::<c::StringUUID>(
+        "StringUUID",
+        r#"{"val": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"}"#,
+    );
+    bench::<c::RepeatedItemPattern>(
+        "RepeatedItemPattern",
+        r#"{"val": ["abc", "def", "ghi", "jkl", "mno", "pqr", "stu", "vwx"]}"#,
+    );
+    bench::<c::RepeatedUnique>(
+        "RepeatedUnique",
+        r#"{"val": ["a", "b", "c", "d", "e", "f"]}"#,
+    );
+    bench::<c::MapValues>(
+        "MapValues",
+        r#"{"val": {"a": "abcd", "b": "bcde", "c": "cdef"}}"#,
+    );
+}
