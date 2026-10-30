@@ -16,8 +16,12 @@ use std::{
     time::Instant,
 };
 
-use buffa::Message;
+use buffa::{
+    Message,
+    view::{HasMessageView, OwnedView},
+};
 use buffa_descriptor::reflect::{DynamicMessage, ReflectMessage};
+use bytes::Bytes;
 use protovalidate_buffa::Validate;
 use protovalidate_buffa_reflect::Validator;
 use protovalidate_buffa_reflect_conformance::cases::buf::validate::conformance::cases::{
@@ -85,7 +89,7 @@ fn measure(mut f: impl FnMut()) -> (f64, f64) {
 
 fn bench<M>(name: &str, json: &str)
 where
-    M: Message + ReflectMessage + Validate + Default,
+    M: Message + ReflectMessage + Validate + Default + HasMessageView,
 {
     // `cargo bench -- <name>` runs the cases whose names contain it.
     if std::env::args()
@@ -120,15 +124,18 @@ where
         let m = M::decode_from_slice(black_box(&bytes)).expect("decodes");
         black_box(m.validate()).expect("valid");
     });
+    let view = OwnedView::<M::View<'static>>::decode(Bytes::from(bytes.clone())).expect("decodes");
+    let viewed = measure(|| black_box(validator.validate_view(black_box(&view))).expect("valid"));
     let encoded = measure(|| {
         black_box(validator.validate_encoded(pool, idx, black_box(&bytes))).expect("valid");
     });
     println!(
-        "{name:<29} {:>4} B | message: generated {:>5.0} ns, encode+validate {:>5.0} ns ({:>4.1}x) | encoded: decode+generated {:>5.0} ns {:>4.1} alloc, validate {:>5.0} ns {:>3.1} alloc ({:>4.2}x)",
+        "{name:<29} {:>4} B | message: generated {:>5.0} ns, encode+validate {:>5.0} ns ({:>4.1}x), view {:>5.0} ns | encoded: decode+generated {:>5.0} ns {:>4.1} alloc, validate {:>5.0} ns {:>3.1} alloc ({:>4.2}x)",
         bytes.len(),
         generated.0,
         typed_ns.0,
         typed_ns.0 / generated.0,
+        viewed.0,
         decode_generated.0,
         decode_generated.1,
         encoded.0,
