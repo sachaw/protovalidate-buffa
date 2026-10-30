@@ -10,10 +10,11 @@
 //! decoded from a schema only known at runtime.
 //!
 //! Standard rules are the CEL in `validate.proto` itself, compiled with the
-//! rule's values folded in, so most become a single comparison against a
-//! literal. CEL is compiled to a typed tree that evaluates without
-//! allocating; what that tree does not express runs on the [`cel`]
-//! interpreter.
+//! rule's values folded in. A rule that folds to a test of the value and its
+//! fields, as every standard rule and most custom rules do, runs as a native
+//! check; other CEL is compiled to a typed tree evaluated over reflection;
+//! what that tree does not express runs on the [`cel`] interpreter. A valid
+//! message validates without allocating.
 //!
 //! Generated types need reflection (`generate_reflection(true)` in
 //! `buffa-build`, or the plugin's `reflection` option).
