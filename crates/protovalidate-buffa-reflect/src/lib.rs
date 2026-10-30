@@ -12,13 +12,16 @@
 //! bytes, as a decoder reads them (the last of a repeated scalar, messages
 //! merged, a oneof's last member, unknown fields and closed enums' unknown
 //! values skipped). A server validates a request before decoding it
-//! ([`Validator::validate_encoded`], and the Connect interceptor); a message
-//! in hand is encoded and validated ([`Validator::validate`]).
+//! ([`Validator::validate_encoded`], and the Connect interceptor); a view
+//! is validated through the bytes it was decoded from
+//! ([`Validator::validate_view`]); a message in hand is encoded and
+//! validated ([`Validator::validate`]).
 //!
 //! Standard rules are the CEL in `validate.proto` itself, compiled with the
 //! rule's values folded in. A rule that folds to a test of the value and its
 //! fields, as every standard rule and most custom rules do, runs as a native
-//! check over the scalars it reads; other CEL is compiled to a typed tree;
+//! check over the scalars it reads, straight off the wire; other CEL is
+//! compiled to a typed tree;
 //! what that tree does not express runs on the [`cel`] interpreter. A valid
 //! message validates without allocating.
 //!

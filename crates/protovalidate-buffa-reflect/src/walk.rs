@@ -296,7 +296,7 @@ impl<'a> Walker<'a> {
                     let Prim::Str(url) = m.prim(url, ScalarType::String) else {
                         continue;
                     };
-                    let listed = urls.iter().any(|u| u.as_bytes() == url);
+                    let listed = urls.iter().any(|u| **u == *url);
                     if listed == *not {
                         let (id, message) = if *not {
                             ("any.not_in", "type URL must not be in the block list")

@@ -423,8 +423,9 @@ pub enum Prim<'a> {
     Uint(u64),
     Double(f64),
     Bool(bool),
-    /// A string's bytes, which a valid encoding holds as UTF-8.
-    Str(&'a [u8]),
+    Str(&'a str),
+    /// A string's bytes that are not UTF-8, which no valid encoding holds.
+    Lossy(&'a [u8]),
     Bytes(&'a [u8]),
     /// A `Timestamp`'s seconds and nanoseconds, within CEL's range and short
     /// of a leap second.
@@ -455,7 +456,9 @@ pub fn prim(raw: Raw<'_>, s: ScalarType) -> Prim<'_> {
         (ScalarType::Fixed32, Raw::I32(v)) => Prim::Uint(u64::from(v)),
         (ScalarType::Sfixed32, Raw::I32(v)) => Prim::Int(i64::from(v as i32)),
         (ScalarType::Float, Raw::I32(v)) => Prim::Double(f64::from(f32::from_bits(v))),
-        (ScalarType::String, Raw::Len(b)) => Prim::Str(b),
+        (ScalarType::String, Raw::Len(b)) => {
+            std::str::from_utf8(b).map_or(Prim::Lossy(b), Prim::Str)
+        }
         (ScalarType::Bytes, Raw::Len(b)) => Prim::Bytes(b),
         (s, _) => zero(s),
     }
@@ -475,7 +478,7 @@ pub const fn zero(s: ScalarType) -> Prim<'static> {
             Prim::Uint(0)
         }
         ScalarType::Bool => Prim::Bool(false),
-        ScalarType::String => Prim::Str(&[]),
+        ScalarType::String => Prim::Str(""),
         ScalarType::Bytes => Prim::Bytes(&[]),
     }
 }
@@ -488,9 +491,8 @@ impl<'a> Prim<'a> {
             Self::Uint(u) => u,
             Self::Double(d) => d.to_bits(),
             Self::Bool(b) => u64::from(b),
-            Self::Str(b) | Self::Bytes(b) => b.iter().fold(0xcbf2_9ce4_8422_2325, |h, &c| {
-                (h ^ u64::from(c)).wrapping_mul(0x100_0000_01b3)
-            }),
+            Self::Str(s) => fnv(s.as_bytes()),
+            Self::Lossy(b) | Self::Bytes(b) => fnv(b),
             Self::Timestamp(s, n) => s.cast_unsigned() ^ u64::from(n),
             Self::Duration(s, n) => s.cast_unsigned() ^ u64::from(n.cast_unsigned()),
         }
@@ -503,7 +505,8 @@ impl<'a> Prim<'a> {
             Self::Uint(u) => u == 0,
             Self::Double(d) => d == 0.0,
             Self::Bool(b) => !b,
-            Self::Str(b) | Self::Bytes(b) => b.is_empty(),
+            Self::Str(s) => s.is_empty(),
+            Self::Lossy(b) | Self::Bytes(b) => b.is_empty(),
             Self::Timestamp(s, n) => s == 0 && n == 0,
             Self::Duration(s, n) => s == 0 && n == 0,
         }
@@ -516,7 +519,8 @@ impl<'a> Prim<'a> {
             Self::Uint(u) => Value::Uint(u),
             Self::Double(d) => Value::Double(d),
             Self::Bool(b) => Value::Bool(b),
-            Self::Str(b) => Value::String(utf8(b)),
+            Self::Str(s) => Value::String(Str::Ref(s)),
+            Self::Lossy(b) => Value::String(utf8(b)),
             Self::Bytes(b) => Value::Bytes(Bin::Ref(b)),
             Self::Timestamp(s, n) => {
                 DateTime::from_timestamp(s, n).map_or(Value::Null, Value::Timestamp)
@@ -554,6 +558,12 @@ pub fn time<'a>(src: &Src<'_>, w: Wkt) -> Option<Prim<'a>> {
         }
         _ => None,
     }
+}
+
+fn fnv(b: &[u8]) -> u64 {
+    b.iter().fold(0xcbf2_9ce4_8422_2325, |h, &c| {
+        (h ^ u64::from(c)).wrapping_mul(0x100_0000_01b3)
+    })
 }
 
 /// A string field's bytes as a string.

@@ -578,7 +578,7 @@ const fn this_prim<'a>(v: Arg<'_, 'a>) -> Option<Prim<'a>> {
         Value::Uint(u) => Some(Prim::Uint(*u)),
         Value::Double(d) => Some(Prim::Double(*d)),
         Value::Bool(b) => Some(Prim::Bool(*b)),
-        Value::String(Str::Ref(s)) => Some(Prim::Str(s.as_bytes())),
+        Value::String(Str::Ref(s)) => Some(Prim::Str(s)),
         Value::Bytes(Bin::Ref(b)) => Some(Prim::Bytes(b)),
         _ => None,
     }
@@ -653,7 +653,8 @@ fn timestamp(x: &Operand) -> Option<Get<i128>> {
 fn string(x: &Operand) -> Option<GetStr> {
     let get = text_or_bytes(x)?;
     Some(Box::new(move |v, c| match get(v, c)? {
-        Prim::Str(b) => Some(utf8(b)),
+        Prim::Str(s) => Some(Str::Ref(s)),
+        Prim::Lossy(b) => Some(utf8(b)),
         Prim::Bytes(b) => std::str::from_utf8(b).ok().map(Str::Ref),
         _ => None,
     }))
@@ -663,7 +664,8 @@ fn string(x: &Operand) -> Option<GetStr> {
 fn bytes(x: &Operand) -> Option<GetBytes> {
     let get = text_or_bytes(x)?;
     Some(Box::new(move |v, c| match get(v, c)? {
-        Prim::Str(b) | Prim::Bytes(b) => Some(Bin::Ref(b)),
+        Prim::Str(s) => Some(Bin::Ref(s.as_bytes())),
+        Prim::Lossy(b) | Prim::Bytes(b) => Some(Bin::Ref(b)),
         _ => None,
     }))
 }
@@ -676,7 +678,7 @@ fn text_or_bytes(x: &Operand) -> Option<GetPrim> {
     let Some((last, path)) = x.path.split_last() else {
         return Some(Box::new(|v, _| match v {
             Arg::Prim(p) => Some(p),
-            Arg::Value(Value::String(Str::Ref(s))) => Some(Prim::Str(s.as_bytes())),
+            Arg::Value(Value::String(Str::Ref(s))) => Some(Prim::Str(s)),
             Arg::Value(Value::Bytes(Bin::Ref(b))) => Some(Prim::Bytes(b)),
             Arg::Value(_) => None,
         }));
