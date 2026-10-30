@@ -47,7 +47,7 @@ mod walk;
 mod wire;
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::HashMap,
     hash::{BuildHasherDefault, Hasher},
     sync::{
@@ -272,11 +272,6 @@ impl Validator {
 #[derive(Clone)]
 pub struct Plan(Arc<Plans>);
 
-thread_local! {
-    /// The walker's slot stack, kept between validations by plan.
-    static SLOTS: Cell<Vec<Found>> = const { Cell::new(Vec::new()) };
-}
-
 impl Plan {
     /// Validates an encoded message of the plan's type, as
     /// [`Validator::validate_encoded`] does.
@@ -290,10 +285,10 @@ impl Plan {
     }
 
     fn run(&self, bytes: &[u8]) -> Result<(), Box<Failure>> {
-        let mut slots = SLOTS.take();
-        let result = run(&self.0, bytes, &mut slots);
-        SLOTS.set(slots);
-        result
+        CACHE.with(|cache| match cache.try_borrow_mut() {
+            Ok(mut cache) => run(&self.0, bytes, &mut cache.spare),
+            Err(_) => run(&self.0, bytes, &mut Vec::new()),
+        })
     }
 }
 
@@ -325,12 +320,6 @@ impl Failure {
 fn run(plans: &Plans, bytes: &[u8], spare: &mut Vec<Found>) -> Result<(), Box<Failure>> {
     let mut walker = Walker::new(plans, std::mem::take(spare));
     let root = Msg::new(Src::Bytes(bytes), plans.root, &plans.pool);
-    // A valid message passes the quick pass; anything else is walked, and
-    // what the walk finds reported.
-    if walker.quick(0, &root) {
-        *spare = std::mem::take(&mut walker.found);
-        return Ok(());
-    }
     let result = walker.root(&root);
     *spare = std::mem::take(&mut walker.found);
     let error = match result.map_err(|abort| *abort) {

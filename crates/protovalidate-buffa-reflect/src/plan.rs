@@ -63,9 +63,6 @@ pub struct MessagePlan {
     /// The fields a walk reads, each in a slot.
     pub slots: Vec<Slot>,
     pub dispatch: Dispatch,
-    /// Whether every check of the message, and of those it holds, runs on
-    /// scalars read off the wire, so a quick pass can tell a valid message.
-    pub quick: bool,
 }
 
 /// A field a walk reads: how, and the slots of the other members of its
@@ -359,7 +356,6 @@ impl<'p> Builder<'p> {
         for (i, m) in types {
             layout(&mut self.plans[i], self.pool.message(m), self.pool);
         }
-        mark_quick(&mut self.plans);
         Plans {
             messages: self.plans,
             root,
@@ -974,72 +970,6 @@ fn value_live(v: &ValuePlan, live: &[bool]) -> bool {
         || v.entries
             .as_ref()
             .is_some_and(|e| value_live(&e.0, live) || value_live(&e.1, live))
-}
-
-/// Marks the plans a quick pass covers: no rule of the message itself, and
-/// each field's checks on scalars, of messages the pass covers too.
-fn mark_quick(plans: &mut [MessagePlan]) {
-    for p in plans.iter_mut() {
-        p.quick = p.error.is_none()
-            && p.rules.is_empty()
-            && p.message_oneofs.is_empty()
-            && p.fields
-                .iter()
-                .all(|f| f.error.is_none() && quick_field(f, &p.slots[f.slot].read));
-    }
-    // A cycle of message types stays covered unless one of them is not.
-    loop {
-        let mut changed = false;
-        for i in 0..plans.len() {
-            let child = |f: &FieldPlan| match f.op {
-                Op::Message(c, _) => Some(c),
-                _ => None,
-            };
-            if plans[i].quick
-                && plans[i]
-                    .fields
-                    .iter()
-                    .filter_map(child)
-                    .any(|c| !plans[c].quick)
-            {
-                plans[i].quick = false;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-}
-
-fn quick_field(f: &FieldPlan, read: &Read) -> bool {
-    let v = &f.value;
-    match f.op {
-        Op::Prim(..) | Op::Time(_) | Op::Message(..) => true,
-        Op::Value => {
-            v.message.is_none()
-                && match (read.shape.card, read.wkt) {
-                    (Card::List, _) => {
-                        v.checks.is_empty()
-                            && v.entries.is_none()
-                            && v.items.as_ref().is_some_and(|i| i.prim)
-                    }
-                    (Card::Map(_), _) => {
-                        v.checks.is_empty()
-                            && v.items.is_none()
-                            && v.entries.as_ref().is_some_and(|e| e.0.prim && e.1.prim)
-                    }
-                    (Card::Singular, Some(Wkt::Wrapper)) => v.prim,
-                    (Card::Singular, Some(Wkt::Any)) => {
-                        !v.ignore_zero
-                            && v.items.is_none()
-                            && v.entries.is_none()
-                            && v.checks.iter().all(|c| matches!(c, Check::AnyIn { .. }))
-                    }
-                    _ => false,
-                }
-        }
-    }
 }
 
 /// Marks the value plans whose checks all run on scalars.
