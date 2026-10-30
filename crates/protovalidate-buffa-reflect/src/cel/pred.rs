@@ -31,22 +31,47 @@ pub enum Pred {
     Text(Operand, fn(&str) -> bool),
     /// A test of a double `x`, such as `x.isNan()`.
     Number(Operand, fn(f64) -> bool),
-    /// A function of `x` and constants.
-    Call(Func, Operand, Box<[Const]>),
-    /// `x.all(e, p)` (true) or `x.exists(e, p)` (false) over a list, `p` a
-    /// predicate of the item.
-    Each(Operand, bool, Box<Self>),
+    /// A function of `x` and further arguments.
+    Call(Func, Operand, Box<[Param]>),
+    /// `x.all(e, p)` (true) or `x.exists(e, p)` (false) over a list's items
+    /// or a map's keys, `p` a predicate of the item; or over a map's values,
+    /// when `p` reads `x[e]` alone.
+    Each(Operand, bool, Over, Box<Self>),
+    /// `c ? a : b`.
+    Cond(Box<(Self, Self, Self)>),
     Not(Box<Self>),
     And(Box<(Self, Self)>),
     Or(Box<(Self, Self)>),
 }
 
-/// `this`, or a path of fields from it.
+/// What a comprehension visits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Over {
+    /// A list's items, or a map's keys.
+    Items,
+    /// A map's values.
+    Values,
+}
+
+/// An argument of a function after its subject.
+#[derive(Clone)]
+pub enum Param {
+    Const(Const),
+    Operand(Operand),
+}
+
+/// `this`, or a path of fields from it, then a field selected by name, a
+/// conversion and arithmetic with a constant, each when there is one.
+#[derive(Clone)]
 pub struct Operand {
     pub base: Base,
     /// Fields read from `this`.
     pub path: Box<[Read]>,
+    /// A field of a `dyn` value, selected by name when it runs.
+    pub name: Option<Box<str>>,
     pub conv: Conv,
+    /// `x <op> y` for arithmetic `op`.
+    pub arith: Option<(Op, Box<Param>)>,
 }
 
 /// Where an operand starts.
@@ -57,6 +82,17 @@ pub enum Base {
     Now(TimeDelta),
 }
 
+/// What stands for `this` in a comprehension's body.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Item {
+    /// Nothing: the predicate is of `this` itself.
+    None,
+    /// The comprehension variable, the item or key.
+    Key(u8),
+    /// `this[var]`, the map value at the key.
+    Value(u8),
+}
+
 /// A conversion applied to an operand's value.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Conv {
@@ -65,6 +101,8 @@ pub enum Conv {
     Bytes,
     /// `string(x)`.
     String,
+    /// `int(x)`.
+    Int,
 }
 
 /// A rule as a native check: it fails when `pred` is `fails_when`, with the
@@ -79,6 +117,11 @@ pub struct Check {
     pub message: Option<Box<str>>,
     /// The expression of a failure's message, when it is not a constant.
     pub explain: Option<Node>,
+}
+
+/// Whether a node could be a message: anything but a bool.
+const fn is_text(n: &Node) -> bool {
+    !matches!(n, Node::Const(Const::Bool(_)))
 }
 
 impl Check {
@@ -109,9 +152,18 @@ impl Check {
             Node::Cond(xs) => {
                 let empty = |n: &Node| matches!(n, Node::Const(Const::String(s)) if s.is_empty());
                 let (fails_when, explain) = match (empty(&xs[1]), empty(&xs[2])) {
-                    (false, true) => (true, &xs[1]),
-                    (true, false) => (false, &xs[2]),
-                    _ => return None,
+                    (false, true) if is_text(&xs[1]) => (true, &xs[1]),
+                    (true, false) if is_text(&xs[2]) => (false, &xs[2]),
+                    _ => {
+                        return Some(Self {
+                            pred: Pred::from_node(node)?,
+                            typed: None,
+                            scalar: false,
+                            fails_when: false,
+                            message: None,
+                            explain: None,
+                        });
+                    }
                 };
                 Some(Self {
                     pred: Pred::from_node(&xs[0])?,
@@ -139,29 +191,59 @@ impl Operand {
         Self {
             base: Base::This,
             path: Box::default(),
+            name: None,
             conv: Conv::None,
+            arith: None,
         }
     }
 
-    fn within(node: &Node, item: Option<u8>) -> Option<Self> {
+    /// Whether the operand is `this` as it is.
+    pub fn is_this(&self) -> bool {
+        self.base == Base::This
+            && self.path.is_empty()
+            && self.name.is_none()
+            && self.conv == Conv::None
+            && self.arith.is_none()
+    }
+
+    fn within(node: &Node, item: Item) -> Option<Self> {
+        let (arith, node) = match node {
+            Node::Op(op @ (Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem), xs)
+                if !matches!(xs[0], Node::Now) =>
+            {
+                let y = match &xs[1] {
+                    Node::Const(c) => Param::Const(c.clone()),
+                    y => Param::Operand(Self::within(y, item)?),
+                };
+                (Some((*op, Box::new(y))), &xs[0])
+            }
+            x => (None, x),
+        };
         let (conv, node) = match node {
             Node::Call1(Func::ToBytes, x) => (Conv::Bytes, &**x),
             Node::Call1(Func::ToString, x) => (Conv::String, &**x),
+            Node::Call1(Func::ToInt, x) => (Conv::Int, &**x),
             x => (Conv::None, x),
+        };
+        let (name, node) = match node {
+            Node::Get(x, name) => (Some(name.clone()), &**x),
+            x => (None, x),
         };
         let now = |d: TimeDelta| {
             Some(Self {
                 base: Base::Now(d),
                 path: Box::new([]),
+                name: None,
                 conv,
+                arith: arith.clone(),
             })
         };
         match node {
             Node::Now => return now(TimeDelta::zero()),
-            Node::Op(op @ (Op::Add | Op::Sub), xs) => {
-                return match (&xs[0], &xs[1], op) {
-                    (Node::Now, Node::Const(Const::Duration(d)), Op::Add) => now(*d),
-                    (Node::Now, Node::Const(Const::Duration(d)), _) => now(-*d),
+            Node::Op(op @ (Op::Add | Op::Sub), xs) if matches!(xs[0], Node::Now) => {
+                return match (&xs[1], op) {
+                    (Node::Const(Const::Duration(d)), Op::Add) => now(*d),
+                    (Node::Const(Const::Duration(d)), _) => now(-*d),
                     _ => None,
                 };
             }
@@ -171,8 +253,13 @@ impl Operand {
         let mut at = node;
         loop {
             match (at, item) {
-                (Node::This, None) => break,
-                (Node::Local(v), Some(i)) if *v == i => break,
+                (Node::This, Item::None) => break,
+                (Node::Local(v), Item::Key(i)) if *v == i => break,
+                (Node::Op(Op::Index, xs), Item::Value(i))
+                    if matches!(xs[0], Node::This) && matches!(xs[1], Node::Local(v) if v == i) =>
+                {
+                    break;
+                }
                 (Node::Field(x, read), _) => {
                     path.push((**read).clone());
                     at = x;
@@ -184,7 +271,9 @@ impl Operand {
         Some(Self {
             base: Base::This,
             path: path.into(),
+            name,
             conv,
+            arith,
         })
     }
 
@@ -192,6 +281,16 @@ impl Operand {
         if let Some(first) = self.path.first() {
             f(first.shape.number);
         }
+        if let Some((_, y)) = &self.arith
+            && let Param::Operand(y) = &**y
+        {
+            y.reads(f);
+        }
+    }
+
+    /// The operand's value.
+    fn value<'a>(&'a self, this: &Value<'a>, clock: &Clock) -> Result<Value<'a>, Error> {
+        self.with(this, clock, |v| Ok(v.clone()))
     }
 
     /// Calls `f` with the operand's value. `this` itself is passed as is,
@@ -203,7 +302,7 @@ impl Operand {
         clock: &Clock,
         f: impl FnOnce(&Value<'a>) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        if let (Base::This, [], Conv::None) = (self.base, &*self.path, self.conv) {
+        if self.is_this() {
             return f(this);
         }
         let mut v = match self.base {
@@ -224,11 +323,21 @@ impl Operand {
                     .ok_or_else(|| Error::new("timestamp overflow"))?,
             ),
         };
+        if let Some(name) = &self.name {
+            v = eval::select(&v, name)?;
+        }
         v = match self.conv {
             Conv::None => v,
             Conv::Bytes => functions::call(&Func::ToBytes, std::slice::from_ref(&v))?,
             Conv::String => functions::call(&Func::ToString, std::slice::from_ref(&v))?,
+            Conv::Int => functions::call(&Func::ToInt, std::slice::from_ref(&v))?,
         };
+        if let Some((op, y)) = &self.arith {
+            v = match &**y {
+                Param::Const(c) => functions::arithmetic(*op, &v, &Value::from_const(c))?,
+                Param::Operand(y) => functions::arithmetic(*op, &v, &y.value(this, clock)?)?,
+            };
+        }
         f(&v)
     }
 }
@@ -243,26 +352,18 @@ fn field<'a>(v: &Value<'a>, read: &'a Read) -> Result<Value<'a>, Error> {
     }
 }
 
-fn consts(nodes: &[Node]) -> Option<Box<[Const]>> {
-    nodes
-        .iter()
-        .map(|a| match a {
-            Node::Const(c) => Some(c.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
 impl Pred {
     fn from_node(node: &Node) -> Option<Self> {
-        Self::within(node, None)
+        Self::within(node, Item::None)
     }
 
-    /// A predicate of `this`, or, in a comprehension's body, of its item
-    /// (local `item`), which then stands for `this`.
-    fn within(node: &Node, item: Option<u8>) -> Option<Self> {
+    /// A predicate of `this`, or, in a comprehension's body, of its item,
+    /// which then stands for `this`.
+    fn within(node: &Node, item: Item) -> Option<Self> {
         Some(match node {
-            Node::CompareThis(op, c) => Self::Compare(Operand::this(), *op, (**c).clone()),
+            Node::CompareThis(op, c) if item == Item::None => {
+                Self::Compare(Operand::this(), *op, (**c).clone())
+            }
             Node::Compare(op, x) => match &x.0 {
                 Node::Size(s, _) | Node::Call1(Func::Size, s) => {
                     Self::Size(Operand::within(s, item)?, *op, x.1.clone())
@@ -294,18 +395,37 @@ impl Pred {
             }
             Node::Call(f, args) if pure(f) => {
                 let (subject, rest) = args.split_first()?;
-                Self::Call(f.clone(), Operand::within(subject, item)?, consts(rest)?)
+                let params = rest
+                    .iter()
+                    .map(|a| match a {
+                        Node::Const(c) => Some(Param::Const(c.clone())),
+                        a => Operand::within(a, item).map(Param::Operand),
+                    })
+                    .collect::<Option<_>>()?;
+                Self::Call(f.clone(), Operand::within(subject, item)?, params)
             }
-            Node::Fold(fold) if item.is_none() => {
+            Node::Fold(fold) if item == Item::None => {
                 let all = match fold.kind {
                     FoldKind::All => true,
                     FoldKind::Exists => false,
                     _ => return None,
                 };
-                let range = Operand::within(&fold.range, None)?;
-                let body = Self::within(fold.test.as_ref()?, Some(fold.var))?;
-                Self::Each(range, all, Box::new(body))
+                let range = Operand::within(&fold.range, Item::None)?;
+                let test = fold.test.as_ref()?;
+                match Self::within(test, Item::Key(fold.var)) {
+                    Some(body) => Self::Each(range, all, Over::Items, Box::new(body)),
+                    None if range.is_this() => {
+                        let body = Self::within(test, Item::Value(fold.var))?;
+                        Self::Each(range, all, Over::Values, Box::new(body))
+                    }
+                    None => return None,
+                }
             }
+            Node::Cond(xs) => Self::Cond(Box::new((
+                Self::within(&xs[0], item)?,
+                Self::within(&xs[1], item)?,
+                Self::within(&xs[2], item)?,
+            ))),
             Node::Not(x) => Self::Not(Box::new(Self::within(x, item)?)),
             Node::And(xs) => Self::And(Box::new((
                 Self::within(&xs[0], item)?,
@@ -329,8 +449,11 @@ impl Pred {
             | Self::In(x, _)
             | Self::Text(x, _)
             | Self::Number(x, _)
-            | Self::Call(_, x, _) => x.path.is_empty(),
-            Self::Compare2(x, _, y) => x.path.is_empty() && y.path.is_empty(),
+            | Self::Call(_, x, _) => x.path.is_empty() && x.name.is_none(),
+            Self::Compare2(x, _, y) => {
+                x.path.is_empty() && y.path.is_empty() && x.name.is_none() && y.name.is_none()
+            }
+            Self::Cond(ps) => ps.0.this_only() && ps.1.this_only() && ps.2.this_only(),
             Self::Has(..) | Self::Each(..) => false,
             Self::Not(p) => p.this_only(),
             Self::And(ps) | Self::Or(ps) => ps.0.this_only() && ps.1.this_only(),
@@ -346,8 +469,20 @@ impl Pred {
             | Self::In(x, _)
             | Self::Text(x, _)
             | Self::Number(x, _)
-            | Self::Call(_, x, _)
             | Self::Each(x, ..) => x.reads(f),
+            Self::Call(_, x, params) => {
+                x.reads(f);
+                for p in &**params {
+                    if let Param::Operand(y) = p {
+                        y.reads(f);
+                    }
+                }
+            }
+            Self::Cond(ps) => {
+                ps.0.reads(f);
+                ps.1.reads(f);
+                ps.2.reads(f);
+            }
             Self::Compare2(x, _, y) => {
                 x.reads(f);
                 y.reads(f);
@@ -364,6 +499,7 @@ impl Pred {
         }
     }
 
+    #[expect(clippy::too_many_lines, reason = "an arm per predicate")]
     pub fn eval<'a>(&'a self, this: &Value<'a>, clock: &Clock) -> Result<bool, Error> {
         match self {
             Self::Compare(x, op, c) => x.with(this, clock, |v| eval::compare_const_bool(*op, v, c)),
@@ -411,13 +547,16 @@ impl Pred {
                 Value::Double(d) => Ok(test(*d)),
                 other => Err(Error::no_overload("double function", &[other.type_of()])),
             }),
-            Self::Call(f, x, consts) => {
+            Self::Call(f, x, params) => {
                 let mut args = [const { Value::Null }; 4];
                 args[0] = x.with(this, clock, |v| Ok(v.clone()))?;
-                for (slot, c) in args[1..].iter_mut().zip(consts.iter()) {
-                    *slot = Value::from_const(c);
+                for (slot, p) in args[1..].iter_mut().zip(params.iter()) {
+                    *slot = match p {
+                        Param::Const(c) => Value::from_const(c),
+                        Param::Operand(y) => y.with(this, clock, |v| Ok(v.clone()))?,
+                    };
                 }
-                match functions::call(f, &args[..=consts.len()])? {
+                match functions::call(f, &args[..=params.len()])? {
                     Value::Bool(b) => Ok(b),
                     other => Err(Error::new(format!(
                         "expected a bool, got {}",
@@ -425,7 +564,14 @@ impl Pred {
                     ))),
                 }
             }
-            Self::Each(x, all, body) => x.with(this, clock, |range| {
+            Self::Cond(ps) => {
+                if ps.0.eval(this, clock)? {
+                    ps.1.eval(this, clock)
+                } else {
+                    ps.2.eval(this, clock)
+                }
+            }
+            Self::Each(x, all, over, body) => x.with(this, clock, |range| {
                 // As CEL's comprehensions: a deciding item absorbs others'
                 // errors.
                 let mut error = None;
@@ -443,6 +589,9 @@ impl Pred {
                 };
                 match range {
                     Value::List(items) => items.for_each(&mut visit),
+                    Value::Map(entries) if *over == Over::Values => {
+                        entries.for_each(&mut |_, v| visit(v));
+                    }
                     Value::Map(entries) => entries.for_each(&mut |k, _| visit(k)),
                     other => {
                         return Err(Error::new(format!(

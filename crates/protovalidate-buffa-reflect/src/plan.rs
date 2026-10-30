@@ -125,6 +125,10 @@ pub struct ValuePlan {
     pub prim: bool,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "most checks are rules; boxing them would cost a load each"
+)]
 pub enum Check {
     Rule(Rule),
     DefinedEnum {

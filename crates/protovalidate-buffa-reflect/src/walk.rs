@@ -141,13 +141,7 @@ impl<'a> Walker<'a> {
 
     /// [`quick_fields`](Self::quick_fields), for a field read as a value:
     /// a repeated field or map with scalar checks, a wrapper, or an `Any`.
-    fn quick_value(
-        &self,
-        field: &'a FieldPlan,
-        read: &Read,
-        found: &Found,
-        msg: &Msg<'a>,
-    ) -> bool {
+    fn quick_value(&self, field: &'a FieldPlan, read: &Read, found: &Found, msg: &Msg<'a>) -> bool {
         let (v, pool) = (&field.value, msg.pool);
         match (read.shape.card, read.shape.kind) {
             (Card::List | Card::Map(_), _) => {

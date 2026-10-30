@@ -23,9 +23,10 @@ use regex_automata::{
 use super::{
     Clock, Ty,
     compile::{Func, Op},
+    eval,
     eval::char_count,
     functions,
-    pred::{Base, Conv, Operand, Pred},
+    pred::{Base, Conv, Operand, Over, Param, Pred},
     value::{Bin, Const, Msg, Prim, Read, Str, Value, Wkt, equals, utf8},
 };
 use crate::wire::{Card, Kind};
@@ -74,10 +75,10 @@ pub fn compile(p: &Pred, this: &Ty) -> Option<Test> {
         Pred::Compare(x, op, c) => {
             let op = *op;
             match (of(x, this)?, c) {
-                (Of::Int, &Const::Int(k)) => against(x, op, k, as_int)?,
-                (Of::Uint, &Const::Uint(k)) => against(x, op, k, as_uint)?,
-                (Of::Double, &Const::Double(k)) => against(x, op, k, as_double)?,
-                (Of::Bool, &Const::Bool(k)) => against(x, op, k, as_bool)?,
+                (Of::Int, &Const::Int(k)) => against(x, op, k, as_int, int)?,
+                (Of::Uint, &Const::Uint(k)) => against(x, op, k, as_uint, uint)?,
+                (Of::Double, &Const::Double(k)) => against(x, op, k, as_double, double)?,
+                (Of::Bool, &Const::Bool(k)) => against(x, op, k, as_bool, boolean)?,
                 (Of::Duration, &Const::Duration(k)) => ordered(duration(x)?, op, span(k)),
                 (Of::Timestamp, &Const::Timestamp(k)) => ordered(timestamp(x)?, op, instant(k)?),
                 (Of::Str, Const::String(k)) => {
@@ -229,8 +230,12 @@ pub fn compile(p: &Pred, this: &Ty) -> Option<Test> {
             let (get, test) = (double(x)?, *test);
             Box::new(move |v, c| Some(test(get(v, c)?)))
         }
-        Pred::Call(f, x, consts) => match (of(x, this)?, f, &**consts) {
-            (Of::Str, Func::StartsWith | Func::EndsWith | Func::Contains, [Const::String(k)]) => {
+        Pred::Call(f, x, params) => match (of(x, this)?, f, &**params) {
+            (
+                Of::Str,
+                Func::StartsWith | Func::EndsWith | Func::Contains,
+                [Param::Const(Const::String(k))],
+            ) => {
                 let (get, k, f) = (string(x)?, k.clone(), f.clone());
                 Box::new(move |v, c| {
                     let s = get(v, c)?;
@@ -241,7 +246,11 @@ pub fn compile(p: &Pred, this: &Ty) -> Option<Test> {
                     })
                 })
             }
-            (Of::Bytes, Func::StartsWith | Func::EndsWith | Func::Contains, [Const::Bytes(k)]) => {
+            (
+                Of::Bytes,
+                Func::StartsWith | Func::EndsWith | Func::Contains,
+                [Param::Const(Const::Bytes(k))],
+            ) => {
                 let (get, k, f) = (bytes(x)?, k.clone(), f.clone());
                 Box::new(move |v, c| {
                     let b = get(v, c)?;
@@ -255,25 +264,19 @@ pub fn compile(p: &Pred, this: &Ty) -> Option<Test> {
             // Functions of a string and constants, and `unique()` of a
             // list: the library's own, on the values read.
             (Of::Str, Func::IsIp | Func::IsIpPrefix | Func::IsHostAndPort, _)
-                if x.conv == Conv::None && consts.len() <= 2 =>
+                if params.len() <= 2 =>
             {
-                library(value(x)?, f, consts)
+                library(value(x)?, f, params)?
             }
-            (Of::List, Func::Unique, []) => library(value(x)?, f, consts),
+            (Of::List, Func::Unique, []) => library(value(x)?, f, params)?,
             _ => return None,
         },
-        Pred::Each(x, all, body) => {
-            if of(x, this)? != Of::List {
-                return None;
-            }
-            let body = compile(body, &item(x, this)?)?;
-            let (get, all) = (value(x)?, *all);
+        Pred::Each(x, all, over, body) => {
+            let body = compile(body, &item(x, *over, this)?)?;
+            let (get, all, over) = (value(x)?, *all, *over);
             Box::new(move |v, c| {
-                let Value::List(items) = get(v, c)? else {
-                    return None;
-                };
                 let mut out = Some(all);
-                items.for_each(&mut |item| match body(&Arg::Value(&item), c) {
+                let mut visit = |item: Value<'_>| match body(&Arg::Value(&item), c) {
                     Some(b) if b != all => {
                         out = Some(!all);
                         false
@@ -283,9 +286,23 @@ pub fn compile(p: &Pred, this: &Ty) -> Option<Test> {
                         out = None;
                         false
                     }
-                });
+                };
+                match (get(v, c)?, over) {
+                    (Value::List(items), Over::Items) => items.for_each(&mut visit),
+                    (Value::Map(m), Over::Items) => m.for_each(&mut |k, _| visit(k)),
+                    (Value::Map(m), Over::Values) => m.for_each(&mut |_, v| visit(v)),
+                    _ => return None,
+                }
                 out
             })
+        }
+        Pred::Cond(ps) => {
+            let (p, a, b) = (
+                compile(&ps.0, this)?,
+                compile(&ps.1, this)?,
+                compile(&ps.2, this)?,
+            );
+            Box::new(move |v, c| if p(v, c)? { a(v, c) } else { b(v, c) })
         }
         Pred::Not(p) => {
             let p = compile(p, this)?;
@@ -302,20 +319,31 @@ pub fn compile(p: &Pred, this: &Ty) -> Option<Test> {
     })
 }
 
-/// A library function of the operand and constants that answers a bool.
-fn library(get: GetValue, f: &Func, consts: &[Const]) -> Test {
-    let (f, consts): (Func, Box<[Const]>) = (f.clone(), consts.into());
-    Box::new(move |v, c| {
+/// A library function of the operand and further arguments that answers a
+/// bool.
+fn library(get: GetValue, f: &Func, params: &[Param]) -> Option<Test> {
+    let f = f.clone();
+    let params: Box<[Result<Const, GetValue>]> = params
+        .iter()
+        .map(|p| match p {
+            Param::Const(k) => Some(Ok(k.clone())),
+            Param::Operand(y) => value(y).map(Err),
+        })
+        .collect::<Option<_>>()?;
+    Some(Box::new(move |v, c| {
         let mut args = [const { Value::Null }; 3];
         args[0] = get(v, c)?;
-        for (slot, k) in args[1..].iter_mut().zip(consts.iter()) {
-            *slot = Value::from_const(k);
+        for (slot, p) in args[1..].iter_mut().zip(params.iter()) {
+            *slot = match p {
+                Ok(k) => Value::from_const(k),
+                Err(get) => get(v, c)?,
+            };
         }
-        match functions::call(&f, &args[..=consts.len()]) {
+        match functions::call(&f, &args[..=params.len()]) {
             Ok(Value::Bool(b)) => Some(b),
             _ => None,
         }
-    })
+    }))
 }
 
 /// `x <op> k`, for a scalar operand; `this` is read in the test itself.
@@ -324,13 +352,14 @@ fn against<T: PartialOrd + Copy + Send + Sync + 'static>(
     op: Op,
     k: T,
     conv: impl Fn(Prim<'_>) -> Option<T> + Copy + Send + Sync + 'static,
+    get: fn(&Operand) -> Option<Get<T>>,
 ) -> Option<Test> {
-    if let (Base::This, [], Conv::None) = (x.base, &*x.path, x.conv) {
+    if x.is_this() {
         return Some(Box::new(move |v, _| {
             Some(decide(op, conv(this_prim(*v)?)?.partial_cmp(&k)))
         }));
     }
-    Some(ordered(read(x, conv)?, op, k))
+    Some(ordered(get(x)?, op, k))
 }
 
 #[inline]
@@ -441,6 +470,9 @@ fn all<T>(items: &[Const], f: impl Fn(&Const) -> Option<T>) -> Option<Box<[T]>> 
 
 /// What an operand holds, after its conversion.
 fn of(x: &Operand, this: &Ty) -> Option<Of> {
+    if x.name.is_some() {
+        return None;
+    }
     let held = match (x.base, x.path.last()) {
         (Base::Now(_), _) => Of::Timestamp,
         (Base::This, None) => match this {
@@ -471,21 +503,47 @@ fn of(x: &Operand, this: &Ty) -> Option<Of> {
             },
         },
     };
-    match (x.conv, held) {
-        (Conv::None, held) => Some(held),
-        (Conv::Bytes, Of::Str | Of::Bytes) => Some(Of::Bytes),
-        (Conv::String, Of::Str | Of::Bytes) => Some(Of::Str),
+    let converted = match (x.conv, held) {
+        (Conv::None, held) => held,
+        (Conv::Bytes, Of::Str | Of::Bytes) => Of::Bytes,
+        (Conv::String, Of::Str | Of::Bytes) => Of::Str,
+        (Conv::Int, Of::Int | Of::Timestamp) => Of::Int,
+        _ => return None,
+    };
+    match x.arith.as_ref().map(|(_, y)| &**y) {
+        None => Some(converted),
+        Some(Param::Const(Const::Int(_))) if converted == Of::Int => Some(Of::Int),
+        Some(Param::Const(Const::Uint(_))) if converted == Of::Uint => Some(Of::Uint),
+        Some(Param::Operand(y))
+            if matches!(converted, Of::Int | Of::Uint) && of(y, this)? == converted =>
+        {
+            Some(converted)
+        }
         _ => None,
     }
 }
 
-/// The type of a list operand's items.
-fn item(x: &Operand, this: &Ty) -> Option<Ty> {
+/// The type of a comprehension's item: a list's item, a map's key or
+/// value.
+fn item(x: &Operand, over: Over, this: &Ty) -> Option<Ty> {
+    if x.name.is_some() || x.conv != Conv::None || x.arith.is_some() {
+        return None;
+    }
     match (x.base, x.path.last()) {
-        (Base::This, None) => match this {
-            Ty::List(t) => Some((**t).clone()),
+        (Base::This, None) => match (this, over) {
+            (Ty::List(t) | Ty::Map(t, _), Over::Items) | (Ty::Map(_, t), Over::Values) => {
+                Some((**t).clone())
+            }
             _ => None,
         },
+        (Base::This, Some(read))
+            if matches!(read.shape.card, Card::Map(_)) && over == Over::Items =>
+        {
+            let Card::Map(key) = read.shape.card else {
+                return None;
+            };
+            Some(Ty::of_scalar(key))
+        }
         (Base::This, Some(read)) => Some(match (read.shape.kind, read.wkt) {
             (Kind::Scalar(s), _) => Ty::of_scalar(s),
             (Kind::Enum(_), _) => Ty::Int,
@@ -531,8 +589,58 @@ fn message(path: &[Read]) -> Option<GetMsg> {
     }))
 }
 
-/// Reads an operand's value, before its conversion, as a CEL value.
+/// Reads an operand's value as a CEL value, its selection, conversion and
+/// arithmetic applied; an error declines.
 fn value(x: &Operand) -> Option<GetValue> {
+    if x.name.is_none() && x.conv == Conv::None && x.arith.is_none() {
+        return held(x);
+    }
+    let get = held(x)?;
+    let arith: Option<(Op, Result<Const, GetValue>)> = match &x.arith {
+        None => None,
+        Some((op, y)) => Some((
+            *op,
+            match &**y {
+                Param::Const(k) => Ok(k.clone()),
+                Param::Operand(y) => Err(value(y)?),
+            },
+        )),
+    };
+    let (name, conv) = (x.name.clone(), x.conv);
+    Some(Box::new(move |v, c| {
+        let mut out = get(v, c)?;
+        if let Some(name) = &name {
+            out = eval::select(&out, name).ok()?;
+        }
+        let f = match conv {
+            Conv::None => None,
+            Conv::Bytes => Some(Func::ToBytes),
+            Conv::String => Some(Func::ToString),
+            Conv::Int => Some(Func::ToInt),
+        };
+        if let Some(f) = f {
+            out = functions::call(&f, std::slice::from_ref(&out)).ok()?;
+        }
+        if let Some((op, y)) = &arith {
+            let y = match y {
+                Ok(k) => Value::from_const(k),
+                Err(get) => get(v, c)?,
+            };
+            // Arithmetic gives a number, which borrows nothing.
+            out = match functions::arithmetic(*op, &out, &y).ok()? {
+                Value::Int(i) => Value::Int(i),
+                Value::Uint(u) => Value::Uint(u),
+                Value::Double(d) => Value::Double(d),
+                _ => return None,
+            };
+        }
+        Some(out)
+    }))
+}
+
+/// Reads an operand's value, before its selection, conversion and
+/// arithmetic.
+fn held(x: &Operand) -> Option<GetValue> {
     if let Base::Now(d) = x.base {
         return Some(Box::new(move |_, c| {
             c.now().checked_add_signed(d).map(Value::Timestamp)
@@ -554,7 +662,7 @@ fn read<T: 'static>(
     x: &Operand,
     conv: impl Fn(Prim<'_>) -> Option<T> + Copy + Send + Sync + 'static,
 ) -> Option<Get<T>> {
-    if x.base != Base::This || x.conv != Conv::None {
+    if x.base != Base::This || x.conv != Conv::None || x.name.is_some() || x.arith.is_some() {
         return None;
     }
     let Some((last, path)) = x.path.split_last() else {
@@ -590,11 +698,21 @@ const fn this_prim<'a>(v: Arg<'_, 'a>) -> Option<Prim<'a>> {
 }
 
 fn int(x: &Operand) -> Option<Get<i64>> {
-    read(x, as_int)
+    read(x, as_int).or_else(|| {
+        computed(x, |v| match v {
+            Value::Int(i) => Some(i),
+            _ => None,
+        })
+    })
 }
 
 fn uint(x: &Operand) -> Option<Get<u64>> {
-    read(x, as_uint)
+    read(x, as_uint).or_else(|| {
+        computed(x, |v| match v {
+            Value::Uint(u) => Some(u),
+            _ => None,
+        })
+    })
 }
 
 fn double(x: &Operand) -> Option<Get<f64>> {
@@ -603,6 +721,18 @@ fn double(x: &Operand) -> Option<Get<f64>> {
 
 fn boolean(x: &Operand) -> Option<Get<bool>> {
     read(x, as_bool)
+}
+
+/// Reads an operand that a selection, conversion or arithmetic computes.
+fn computed<T: 'static>(
+    x: &Operand,
+    conv: impl Fn(Value<'_>) -> Option<T> + Send + Sync + 'static,
+) -> Option<Get<T>> {
+    if x.name.is_none() && x.conv == Conv::None && x.arith.is_none() {
+        return None;
+    }
+    let get = value(x)?;
+    Some(Box::new(move |v, c| conv(get(v, c)?)))
 }
 
 /// A `Duration` in nanoseconds, which orders as the duration does.
@@ -623,7 +753,7 @@ fn nanos(s: i64, n: i64) -> i128 {
 
 /// Reads a `Duration` operand, in nanoseconds.
 fn duration(x: &Operand) -> Option<Get<i128>> {
-    if let (Base::This, [], Conv::None) = (x.base, &*x.path, x.conv) {
+    if x.is_this() {
         return Some(Box::new(|v, _| match *v {
             Arg::Prim(Prim::Duration(s, n)) => Some(nanos(s, i64::from(n))),
             Arg::Value(Value::Duration(d)) => Some(span(*d)),
@@ -639,7 +769,7 @@ fn duration(x: &Operand) -> Option<Get<i128>> {
 
 /// Reads a `Timestamp` operand, in nanoseconds since the epoch.
 fn timestamp(x: &Operand) -> Option<Get<i128>> {
-    if let (Base::This, [], Conv::None) = (x.base, &*x.path, x.conv) {
+    if x.is_this() {
         return Some(Box::new(|v, _| match *v {
             Arg::Prim(Prim::Timestamp(s, n)) => Some(nanos(s, i64::from(n))),
             Arg::Value(Value::Timestamp(t)) => instant(*t),
@@ -677,7 +807,11 @@ fn bytes(x: &Operand) -> Option<GetBytes> {
 
 /// Reads a string or bytes operand's bytes, whichever conversion it has.
 fn text_or_bytes(x: &Operand) -> Option<GetPrim> {
-    if x.base != Base::This {
+    if x.base != Base::This
+        || x.name.is_some()
+        || x.arith.is_some()
+        || !matches!(x.conv, Conv::None | Conv::Bytes | Conv::String)
+    {
         return None;
     }
     let Some((last, path)) = x.path.split_last() else {
