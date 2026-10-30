@@ -48,14 +48,24 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
+/// `cargo bench` passes `--bench`; `cargo test --all-targets` runs this
+/// binary too, without it, to check it still works, not to time it.
+fn timing() -> bool {
+    std::env::args().any(|a| a == "--bench")
+}
+
 /// Best of seven runs: nanoseconds and allocations per call.
 fn measure(mut f: impl FnMut()) -> (f64, f64) {
-    for _ in 0..20_000 {
+    let (warm, n) = if timing() {
+        (20_000, 200_000u32)
+    } else {
+        (1, 1)
+    };
+    for _ in 0..warm {
         f();
     }
     let mut best = (f64::MAX, 0.0);
     for _ in 0..7 {
-        let n = 200_000u32;
         let a0 = ALLOCS.load(Relaxed);
         let t = Instant::now();
         for _ in 0..n {
