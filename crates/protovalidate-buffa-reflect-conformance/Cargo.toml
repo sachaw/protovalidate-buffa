@@ -1,0 +1,27 @@
+[package]
+name = "protovalidate-buffa-reflect-conformance"
+version = "0.0.0"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Conformance executor for protovalidate-buffa-reflect, over messages decoded from the harness's descriptors."
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[[bin]]
+name = "protovalidate-buffa-reflect-conformance"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+buffa = "0.9.2"
+buffa-descriptor = { version = "0.9.2", features = ["reflect"] }
+protovalidate-buffa = { path = "../protovalidate-buffa", version = "0.7.2", default-features = false, features = ["protos"] }
+protovalidate-buffa-reflect = { path = "../protovalidate-buffa-reflect", features = ["tz"] }
+
+[lints]
+workspace = true
