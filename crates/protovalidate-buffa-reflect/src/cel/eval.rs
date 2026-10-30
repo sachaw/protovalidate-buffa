@@ -1,0 +1,345 @@
+//! Evaluating a [`Node`] tree.
+
+use std::rc::Rc;
+
+use super::{
+    Clock, Error,
+    compile::{Fold, FoldKind, Node, Op},
+    functions,
+    value::{List, Map, Msg, Value, compare, equals},
+};
+
+const LOCALS: usize = 8;
+
+struct Frame<'a, 'c> {
+    this: Value<'a>,
+    clock: Option<&'c Clock>,
+    locals: [Value<'a>; LOCALS],
+}
+
+pub fn run<'a>(node: &'a Node, this: &Value<'a>, clock: &Clock) -> Result<Value<'a>, Error> {
+    let mut frame = Frame {
+        this: this.clone(),
+        clock: Some(clock),
+        locals: [const { Value::Null }; LOCALS],
+    };
+    eval(node, &mut frame)
+}
+
+/// Evaluates a node that reads no input, for folding.
+pub fn constant(node: &Node) -> Result<Value<'_>, Error> {
+    let mut frame = Frame {
+        this: Value::Null,
+        clock: None,
+        locals: [const { Value::Null }; LOCALS],
+    };
+    eval(node, &mut frame)
+}
+
+fn boolean(v: &Value<'_>, function: &str) -> Result<bool, Error> {
+    match v {
+        Value::Bool(b) => Ok(*b),
+        other => Err(Error::no_overload(function, &[other.type_of()])),
+    }
+}
+
+fn message<'v, 'a>(v: &'v Value<'a>) -> Result<&'v Msg<'a>, Error> {
+    match v {
+        Value::Message(m) => Ok(m),
+        other => Err(Error::new(format!(
+            "type '{}' does not support field selection",
+            other.type_of().name()
+        ))),
+    }
+}
+
+fn eval<'a>(node: &'a Node, f: &mut Frame<'a, '_>) -> Result<Value<'a>, Error> {
+    Ok(match node {
+        Node::Const(c) => Value::from_const(c),
+        Node::This => f.this.clone(),
+        Node::Now => Value::Timestamp(
+            f.clock
+                .ok_or_else(|| Error::new("`now` is not constant"))?
+                .now(),
+        ),
+        Node::Local(s) => f.locals[usize::from(*s)].clone(),
+        Node::Field(x, i) => {
+            let v = eval(x, f)?;
+            message(&v)?.field(*i as usize)
+        }
+        Node::Has(x, i) => {
+            let v = eval(x, f)?;
+            let m = message(&v)?;
+            Value::Bool(m.has(&m.descriptor().fields()[*i as usize]))
+        }
+        Node::Get(x, name) => select(&eval(x, f)?, name)?,
+        Node::HasName(x, name) => match eval(x, f)? {
+            Value::Message(m) => Value::Bool(
+                m.has_by_name(name)
+                    .ok_or_else(|| Error::new(format!("no such field '{name}'")))?,
+            ),
+            Value::Map(m) => Value::Bool(
+                m.get(&Value::String(super::value::Str::Ref(name)))?
+                    .is_some(),
+            ),
+            other => {
+                return Err(Error::new(format!(
+                    "invalid type for field selection: {}",
+                    other.type_of().name()
+                )));
+            }
+        },
+        Node::Not(x) => Value::Bool(!boolean(&eval(x, f)?, "!_")?),
+        Node::Neg(x) => functions::negate(&eval(x, f)?)?,
+        Node::And(xs) => logic(true, &xs[0], &xs[1], f)?,
+        Node::Or(xs) => logic(false, &xs[0], &xs[1], f)?,
+        Node::Cond(xs) => {
+            if boolean(&eval(&xs[0], f)?, "_?_:_")? {
+                eval(&xs[1], f)?
+            } else {
+                eval(&xs[2], f)?
+            }
+        }
+        Node::Op(op, xs) => {
+            let a = eval(&xs[0], f)?;
+            let b = eval(&xs[1], f)?;
+            binary(*op, &a, &b)?
+        }
+        Node::List(xs) => {
+            let mut items = Vec::with_capacity(xs.len());
+            for x in xs {
+                items.push(eval(x, f)?);
+            }
+            Value::List(List::Owned(items.into()))
+        }
+        Node::Map(es) => {
+            let mut entries: Vec<(Value<'a>, Value<'a>)> = Vec::with_capacity(es.len());
+            for (k, v) in es {
+                let k = eval(k, f)?;
+                if !matches!(
+                    k,
+                    Value::Bool(_) | Value::Int(_) | Value::Uint(_) | Value::String(_)
+                ) {
+                    return Err(Error::new("unsupported map key type"));
+                }
+                if entries.iter().any(|(e, _)| equals(e, &k)) {
+                    return Err(Error::new("duplicate map key"));
+                }
+                entries.push((k, eval(v, f)?));
+            }
+            Value::Map(Map::Owned(entries.into()))
+        }
+        Node::Call(func, xs) => {
+            let mut args = [const { Value::Null }; 4];
+            let n = xs.len().min(4);
+            for (slot, x) in args.iter_mut().zip(xs.iter()) {
+                *slot = eval(x, f)?;
+            }
+            functions::call(func, &args[..n])?
+        }
+        Node::Fold(fold) => comprehension(fold, f)?,
+    })
+}
+
+pub fn select<'a>(v: &Value<'a>, name: &str) -> Result<Value<'a>, Error> {
+    match v {
+        Value::Message(m) => m
+            .field_by_name(name)
+            .ok_or_else(|| Error::new(format!("no such field '{name}'"))),
+        Value::Map(m) => m
+            .get(&Value::String(super::value::Str::Ref(name)))?
+            .ok_or_else(|| Error::new(format!("no such key: {name}"))),
+        other => Err(Error::new(format!(
+            "type '{}' does not support field selection",
+            other.type_of().name()
+        ))),
+    }
+}
+
+/// `&&` and `||`, commutative over errors as CEL specifies: an error on one
+/// side yields to a deciding value on the other.
+fn logic<'a>(
+    and: bool,
+    a: &'a Node,
+    b: &'a Node,
+    f: &mut Frame<'a, '_>,
+) -> Result<Value<'a>, Error> {
+    let name = if and { "_&&_" } else { "_||_" };
+    let decides = !and;
+    let first = eval(a, f).and_then(|v| boolean(&v, name));
+    if first == Ok(decides) {
+        return Ok(Value::Bool(decides));
+    }
+    let second = eval(b, f).and_then(|v| boolean(&v, name));
+    match (first, second) {
+        (_, Ok(x)) if x == decides => Ok(Value::Bool(decides)),
+        (Err(e), _) | (Ok(_), Err(e)) => Err(e),
+        (Ok(_), Ok(x)) => Ok(Value::Bool(x)),
+    }
+}
+
+pub fn binary<'a>(op: Op, a: &Value<'a>, b: &Value<'a>) -> Result<Value<'a>, Error> {
+    use std::cmp::Ordering as O;
+    Ok(match op {
+        Op::Eq => Value::Bool(equals(a, b)),
+        Op::Ne => Value::Bool(!equals(a, b)),
+        Op::Lt => Value::Bool(lt(a, b, "_<_", |o| o == O::Less)?),
+        Op::Le => Value::Bool(lt(a, b, "_<=_", |o| o != O::Greater)?),
+        Op::Gt => Value::Bool(lt(a, b, "_>_", |o| o == O::Greater)?),
+        Op::Ge => Value::Bool(lt(a, b, "_>=_", |o| o != O::Less)?),
+        Op::In => Value::Bool(contains(b, a)?),
+        Op::Index => index(a, b)?,
+        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem => functions::arithmetic(op, a, b)?,
+    })
+}
+
+/// A comparison. NaN compares false against everything.
+fn lt(
+    a: &Value<'_>,
+    b: &Value<'_>,
+    name: &str,
+    test: impl Fn(std::cmp::Ordering) -> bool,
+) -> Result<bool, Error> {
+    match compare(a, b) {
+        Ok(Some(o)) => Ok(test(o)),
+        Ok(None) => Ok(false),
+        Err(_) => Err(Error::no_overload(name, &[a.type_of(), b.type_of()])),
+    }
+}
+
+fn contains(container: &Value<'_>, item: &Value<'_>) -> Result<bool, Error> {
+    match container {
+        Value::List(l) => Ok((0..l.len()).any(|i| l.get(i).is_some_and(|v| equals(&v, item)))),
+        Value::Map(m) => Ok(m.get(item).unwrap_or(None).is_some()),
+        other => Err(Error::no_overload(
+            "@in",
+            &[item.type_of(), other.type_of()],
+        )),
+    }
+}
+
+fn index<'a>(container: &Value<'a>, key: &Value<'a>) -> Result<Value<'a>, Error> {
+    match (container, key) {
+        (Value::List(l), Value::Int(_) | Value::Uint(_) | Value::Double(_)) => {
+            let i = match *key {
+                Value::Int(i) => i,
+                Value::Uint(u) => i64::try_from(u).unwrap_or(i64::MAX),
+                Value::Double(d) if d.fract() == 0.0 && d.abs() < 9e18 => {
+                    #[expect(clippy::cast_possible_truncation, reason = "integral and in range")]
+                    let i = d as i64;
+                    i
+                }
+                _ => return Err(Error::new("invalid list index")),
+            };
+            usize::try_from(i)
+                .ok()
+                .and_then(|i| l.get(i))
+                .ok_or_else(|| Error::new(format!("index out of bounds: {i}")))
+        }
+        (Value::Map(m), k) => m
+            .get(k)?
+            .ok_or_else(|| Error::new(format!("no such key: {k:?}"))),
+        (c, k) => Err(Error::no_overload("_[_]", &[c.type_of(), k.type_of()])),
+    }
+}
+
+/// Visits a range's elements (a list's items, a map's keys) until `f`
+/// returns false.
+fn each<'a>(range: &Value<'a>, f: &mut dyn FnMut(Value<'a>) -> bool) -> Result<(), Error> {
+    match range {
+        Value::List(l) => {
+            for i in 0..l.len() {
+                if !f(l.get(i).unwrap_or(Value::Null)) {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        Value::Map(m) => {
+            m.for_each(&mut |k, _| f(k));
+            Ok(())
+        }
+        other => Err(Error::new(format!(
+            "expression of type '{}' cannot be the range of a comprehension",
+            other.type_of().name()
+        ))),
+    }
+}
+
+fn comprehension<'a>(fold: &'a Fold, f: &mut Frame<'a, '_>) -> Result<Value<'a>, Error> {
+    let range = eval(&fold.range, f)?;
+    let var = usize::from(fold.var);
+    let mut error: Option<Error> = None;
+    match fold.kind {
+        FoldKind::All | FoldKind::Exists => {
+            let decides = fold.kind == FoldKind::Exists;
+            let test = fold.test.as_ref().expect("all and exists have a predicate");
+            let mut decided = false;
+            each(&range, &mut |item| {
+                f.locals[var] = item;
+                match eval(test, f).and_then(|v| boolean(&v, "predicate")) {
+                    Ok(b) if b == decides => {
+                        decided = true;
+                        false
+                    }
+                    Ok(_) => true,
+                    Err(e) => {
+                        error.get_or_insert(e);
+                        true
+                    }
+                }
+            })?;
+            if decided {
+                return Ok(Value::Bool(decides));
+            }
+            error.map_or(Ok(Value::Bool(!decides)), Err)
+        }
+        FoldKind::ExistsOne => {
+            let test = fold.test.as_ref().expect("exists_one has a predicate");
+            let mut count = 0usize;
+            each(&range, &mut |item| {
+                f.locals[var] = item;
+                match eval(test, f).and_then(|v| boolean(&v, "predicate")) {
+                    Ok(b) => {
+                        count += usize::from(b);
+                        true
+                    }
+                    Err(e) => {
+                        error = Some(e);
+                        false
+                    }
+                }
+            })?;
+            error.map_or(Ok(Value::Bool(count == 1)), Err)
+        }
+        FoldKind::Map => {
+            let transform = fold.transform.as_ref().expect("map has a transform");
+            let mut out = Vec::new();
+            each(&range, &mut |item| {
+                f.locals[var] = item;
+                let keep = match &fold.test {
+                    Some(t) => eval(t, f).and_then(|v| boolean(&v, "filter")),
+                    None => Ok(true),
+                };
+                match keep.and_then(|k| {
+                    if k {
+                        eval(transform, f).map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                }) {
+                    Ok(Some(v)) => {
+                        out.push(v);
+                        true
+                    }
+                    Ok(None) => true,
+                    Err(e) => {
+                        error = Some(e);
+                        false
+                    }
+                }
+            })?;
+            error.map_or_else(|| Ok(Value::List(List::Owned(Rc::from(out)))), Err)
+        }
+    }
+}

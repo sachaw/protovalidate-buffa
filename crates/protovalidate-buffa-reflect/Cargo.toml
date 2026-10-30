@@ -1,0 +1,39 @@
+[package]
+name = "protovalidate-buffa-reflect"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Protovalidate for buffa messages through reflection: rules are read from the descriptor pool and compiled once per message type, with no code generation."
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+buffa = "0.9.2"
+buffa-descriptor = { version = "0.9.2", features = ["reflect"] }
+cel = { version = "0.15", default-features = false, features = ["chrono", "regex"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = { version = "0.10", optional = true }
+connectrpc = { version = "0.9", default-features = false, optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true }
+protovalidate-buffa = { path = "../protovalidate-buffa", version = "0.7.2", default-features = false }
+regex = "1"
+
+[features]
+default = []
+# A Connect interceptor that validates every request against a descriptor
+# pool, and `Validator::check` for validating in a handler.
+connect = [
+  "buffa-descriptor/json",
+  "dep:connectrpc",
+  "dep:futures-util",
+  "protovalidate-buffa/connect",
+]
+# IANA time zones for the time zone argument of CEL timestamp accessors.
+tz = ["dep:chrono-tz"]
+
+[lints]
+workspace = true

@@ -6,6 +6,8 @@ members = [
   "crates/protovalidate-buffa-conformance",
   "crates/protovalidate-buffa-macros",
   "crates/protovalidate-buffa-protos",
+  "crates/protovalidate-buffa-reflect",
+  "crates/protovalidate-buffa-reflect-conformance",
   "examples/packaging",
 ]
 
