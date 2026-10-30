@@ -74,10 +74,10 @@ pub fn compile(p: &Pred, this: &Ty) -> Option<Test> {
         Pred::Compare(x, op, c) => {
             let op = *op;
             match (of(x, this)?, c) {
-                (Of::Int, &Const::Int(k)) => ordered(int(x)?, op, k),
-                (Of::Uint, &Const::Uint(k)) => ordered(uint(x)?, op, k),
-                (Of::Double, &Const::Double(k)) => ordered(double(x)?, op, k),
-                (Of::Bool, &Const::Bool(k)) => ordered(boolean(x)?, op, k),
+                (Of::Int, &Const::Int(k)) => against(x, op, k, as_int)?,
+                (Of::Uint, &Const::Uint(k)) => against(x, op, k, as_uint)?,
+                (Of::Double, &Const::Double(k)) => against(x, op, k, as_double)?,
+                (Of::Bool, &Const::Bool(k)) => against(x, op, k, as_bool)?,
                 (Of::Duration, &Const::Duration(k)) => ordered(duration(x)?, op, span(k)),
                 (Of::Timestamp, &Const::Timestamp(k)) => ordered(timestamp(x)?, op, instant(k)?),
                 (Of::Str, Const::String(k)) => {
@@ -318,6 +318,49 @@ fn library(get: GetValue, f: &Func, consts: &[Const]) -> Test {
     })
 }
 
+/// `x <op> k`, for a scalar operand; `this` is read in the test itself.
+fn against<T: PartialOrd + Copy + Send + Sync + 'static>(
+    x: &Operand,
+    op: Op,
+    k: T,
+    conv: fn(Prim<'_>) -> Option<T>,
+) -> Option<Test> {
+    if let (Base::This, [], Conv::None) = (x.base, &*x.path, x.conv) {
+        return Some(Box::new(move |v, _| {
+            Some(decide(op, conv(this_prim(v)?)?.partial_cmp(&k)))
+        }));
+    }
+    Some(ordered(read(x, conv)?, op, k))
+}
+
+const fn as_int(p: Prim<'_>) -> Option<i64> {
+    match p {
+        Prim::Int(i) => Some(i),
+        _ => None,
+    }
+}
+
+const fn as_uint(p: Prim<'_>) -> Option<u64> {
+    match p {
+        Prim::Uint(u) => Some(u),
+        _ => None,
+    }
+}
+
+const fn as_double(p: Prim<'_>) -> Option<f64> {
+    match p {
+        Prim::Double(d) => Some(d),
+        _ => None,
+    }
+}
+
+const fn as_bool(p: Prim<'_>) -> Option<bool> {
+    match p {
+        Prim::Bool(b) => Some(b),
+        _ => None,
+    }
+}
+
 /// `x <op> k`, for an operand of an ordered type.
 fn ordered<T: PartialOrd + Send + Sync + 'static>(get: Get<T>, op: Op, k: T) -> Test {
     Box::new(move |v, c| Some(decide(op, get(v, c)?.partial_cmp(&k))))
@@ -542,31 +585,19 @@ const fn this_prim<'a>(v: Arg<'_, 'a>) -> Option<Prim<'a>> {
 }
 
 fn int(x: &Operand) -> Option<Get<i64>> {
-    read(x, |p| match p {
-        Prim::Int(i) => Some(i),
-        _ => None,
-    })
+    read(x, as_int)
 }
 
 fn uint(x: &Operand) -> Option<Get<u64>> {
-    read(x, |p| match p {
-        Prim::Uint(u) => Some(u),
-        _ => None,
-    })
+    read(x, as_uint)
 }
 
 fn double(x: &Operand) -> Option<Get<f64>> {
-    read(x, |p| match p {
-        Prim::Double(d) => Some(d),
-        _ => None,
-    })
+    read(x, as_double)
 }
 
 fn boolean(x: &Operand) -> Option<Get<bool>> {
-    read(x, |p| match p {
-        Prim::Bool(b) => Some(b),
-        _ => None,
-    })
+    read(x, as_bool)
 }
 
 /// A `Duration` in nanoseconds, which orders as the duration does.

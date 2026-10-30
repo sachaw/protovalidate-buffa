@@ -170,12 +170,13 @@ impl Program {
     /// of `this` alone; `None` otherwise.
     #[inline]
     pub fn passes_prim(&self, this: Prim<'_>, clock: &Clock) -> Option<bool> {
-        match &self.0 {
-            Kind::Check(check) if check.scalar => check
-                .typed
-                .as_ref()
-                .and_then(|test| test(typed::Arg::Prim(this), clock))
-                .map(|held| held != check.fails_when),
+        let Kind::Check(check) = &self.0 else {
+            return None;
+        };
+        match (&check.typed, check.scalar) {
+            (Some(test), true) => {
+                test(typed::Arg::Prim(this), clock).map(|held| held != check.fails_when)
+            }
             _ => None,
         }
     }
@@ -201,11 +202,19 @@ impl Program {
                     Some(held) => held,
                     None => check.pred.eval(this, clock)?,
                 };
-                return Ok(if held == check.fails_when {
-                    Outcome::Fail(check.message.as_deref().map(Str::Ref))
-                } else {
-                    Outcome::Pass
-                });
+                if held != check.fails_when {
+                    return Ok(Outcome::Pass);
+                }
+                let Some(explain) = &check.explain else {
+                    return Ok(Outcome::Fail(check.message.as_deref().map(Str::Ref)));
+                };
+                return match eval::run(explain, eval::LOCALS, this, clock)? {
+                    Value::String(s) => Ok(Outcome::Fail(Some(s))),
+                    other => Err(Error::new(format!(
+                        "expression outputs {}, wanted bool or string",
+                        other.type_of().name()
+                    ))),
+                };
             }
             Kind::Native(node, locals) => eval::run(node, *locals, this, clock)?,
             Kind::Fallback(program) => return program.eval(this, clock),

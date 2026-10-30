@@ -231,12 +231,12 @@ impl<'a> Walker<'a> {
                     }
                     let read = &plan.slots[field.slot].read;
                     let src = found.message(&msg.src, read.shape.number);
-                    match value::time(&src, w) {
-                        Some(p) => self.prim(&field.value, p, &here, false)?,
-                        None => {
-                            let value = value::message_as(Msg::new(src, msg.index, pool), Some(w));
-                            self.value(&field.value, &value, &here, false)?;
-                        }
+                    if let Some(p) = value::time(&src, w) {
+                        self.prim(&field.value, p, &here, false)?;
+                    } else {
+                        // Out of a scalar's reach: read as CEL reads it.
+                        let value = value::singular(&found, &msg.src, read, pool);
+                        self.value(&field.value, &value, &here, false)?;
                     }
                 }
                 Op::Message(child, index) => {

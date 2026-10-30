@@ -693,7 +693,7 @@ impl<'a> Field<'a> {
             return false;
         }
         let _ = wire::elements(&self.src, self.number, self.kind, self.pool, &mut |raw| {
-            item(raw).is_some_and(|p| f(p))
+            item(raw).is_some_and(&mut *f)
         });
         true
     }
@@ -729,6 +729,7 @@ impl<'a> Field<'a> {
     /// wire, until `f` returns false; false, visiting nothing, for another
     /// map or one whose keys may repeat.
     fn prim_entries(&self, f: &mut dyn FnMut(Prim<'a>, Prim<'a>) -> bool) -> bool {
+        const SMALL: usize = 8;
         let Card::Map(key) = self.card else {
             return false;
         };
@@ -747,7 +748,6 @@ impl<'a> Field<'a> {
         };
         // A few entries are read in one pass and their keys compared
         // pairwise; more are first checked for a key that may repeat.
-        const SMALL: usize = 8;
         let mut small = [(Prim::Int(0), Prim::Int(0)); SMALL];
         let mut n = 0;
         let _ = wire::entries(

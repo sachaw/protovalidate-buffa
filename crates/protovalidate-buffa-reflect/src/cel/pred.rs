@@ -77,6 +77,8 @@ pub struct Check {
     pub scalar: bool,
     pub fails_when: bool,
     pub message: Option<Box<str>>,
+    /// The expression of a failure's message, when it is not a constant.
+    pub explain: Option<Node>,
 }
 
 impl Check {
@@ -89,6 +91,7 @@ impl Check {
                     scalar: false,
                     fails_when: true,
                     message: Some(m.clone()),
+                    explain: None,
                 }),
                 (Const::String(e), Const::String(m)) if e.is_empty() => Some(Self {
                     pred: Pred::from_node(&x.0)?,
@@ -96,15 +99,36 @@ impl Check {
                     scalar: false,
                     fails_when: false,
                     message: Some(m.clone()),
+                    explain: None,
                 }),
                 _ => None,
             },
+            // `p ? message : ''` and `p ? '' : message`, the message built
+            // from the value: the test is native, the message is evaluated
+            // only for a failure.
+            Node::Cond(xs) => {
+                let empty = |n: &Node| matches!(n, Node::Const(Const::String(s)) if s.is_empty());
+                let (fails_when, explain) = match (empty(&xs[1]), empty(&xs[2])) {
+                    (false, true) => (true, &xs[1]),
+                    (true, false) => (false, &xs[2]),
+                    _ => return None,
+                };
+                Some(Self {
+                    pred: Pred::from_node(&xs[0])?,
+                    typed: None,
+                    scalar: false,
+                    fails_when,
+                    message: None,
+                    explain: Some(explain.clone()),
+                })
+            }
             n => Some(Self {
                 pred: Pred::from_node(n)?,
                 typed: None,
                 scalar: false,
                 fails_when: false,
                 message: None,
+                explain: None,
             }),
         }
     }
