@@ -85,9 +85,14 @@ Compared to reflection-based implementations, the codegen approach has two chara
 | [`protovalidate-buffa-macros`](crates/protovalidate-buffa-macros/) | `#[connect_impl]` attribute macro — inserts request validation at the top of every handler in a service `impl` block. Re-exported from the runtime crate. |
 | [`protoc-gen-protovalidate-buffa`](crates/protoc-gen-protovalidate-buffa/) | Codegen plugin. Reads `(buf.validate.*)` extensions off descriptors via buffa's `ExtensionSet`, emits `impl Validate for Foo` blocks. Wire into `buf.gen.yaml`. |
 | [`protovalidate-buffa-protos`](crates/protovalidate-buffa-protos/) | Checked-in Buffa types for `buf/validate/validate.proto`, shared by the codegen plugin and structured runtime errors. |
+| [`protovalidate-buffa-reflect`](crates/protovalidate-buffa-reflect/) | Validation without code generation, as protovalidate's other implementations do it: rules are read from the descriptor pool, compiled once per message type, and checked through buffa's reflection. Validates generated types built with reflection and `DynamicMessage`s alike; its Connect interceptor validates every request of a service from the service's descriptors. |
 
 `protovalidate-buffa-conformance` also lives in this workspace but is private
 (`publish = false`). See [its README] for the conformance test-run flow.
+`protovalidate-buffa-reflect-conformance`, also private, runs the same suite
+against the reflection validator over messages decoded from the harness's own
+descriptors, and compares the two validators (`cargo bench -p
+protovalidate-buffa-reflect-conformance`).
 
 ## Compatibility
 
@@ -426,7 +431,15 @@ features disabled.
 ## Conformance testing
 
 See the [conformance README] for how to build the dispatch binary and drive the
-upstream harness locally. CI runs
+upstream harness locally. The reflection validator runs the same way:
+
+```bash
+cargo build --release -p protovalidate-buffa-reflect-conformance
+protovalidate-conformance --strict_message --strict_error \
+  target/release/protovalidate-buffa-reflect-conformance
+# -> PASS (failed: 0, skipped: 0, passed: 2872, total: 2872)
+```
+ CI runs
 `cargo clippy --workspace --all-targets -- -D warnings` and
 `cargo test --workspace` on every push; conformance is currently a local-only /
 pre-release check.
