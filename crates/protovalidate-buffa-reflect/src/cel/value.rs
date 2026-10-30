@@ -735,6 +735,27 @@ impl<'a> List<'a> {
         out
     }
 
+    /// Visits every item of a repeated scalar field as the scalar read off
+    /// the wire, until `f` returns false; false for any other list.
+    pub fn prims(&self, f: &mut dyn FnMut(Prim<'a>) -> bool) -> bool {
+        let Self::Field(field) = self else {
+            return false;
+        };
+        let s = match field.kind {
+            Kind::Scalar(s) => s,
+            Kind::Enum(_) => ScalarType::Int32,
+            Kind::Message(_) => return false,
+        };
+        let _ = wire::elements(
+            &field.src,
+            field.number,
+            field.kind,
+            field.pool,
+            &mut |raw| f(prim(raw, s)),
+        );
+        true
+    }
+
     /// Visits every item until `f` returns false.
     pub fn for_each(&self, f: &mut dyn FnMut(Value<'a>) -> bool) {
         match self {

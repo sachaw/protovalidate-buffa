@@ -100,7 +100,7 @@ struct Cache {
     /// A buffer to encode messages into.
     buffer: Vec<u8>,
     /// The walker's slot buffers.
-    spare: Vec<Vec<Found>>,
+    spare: Vec<Found>,
 }
 
 impl Default for Validator {
@@ -166,6 +166,19 @@ impl Validator {
         let md = pool.message(message);
         self.with_cache(md, pool, |plans, scratch| run(plans, bytes, scratch.spare))
             .map_err(|f| (*f).into_error(md))
+    }
+
+    /// The standard rules of `message`'s type, and the types it holds, that
+    /// do not run as native checks: for testing that every one does.
+    #[doc(hidden)]
+    pub fn interpreted_rules(
+        &self,
+        pool: &Arc<DescriptorPool>,
+        message: MessageIndex,
+    ) -> Vec<Box<str>> {
+        self.with_cache(pool.message(message), pool, |plans, _| {
+            plans.interpreted.clone()
+        })
     }
 
     /// [`validate_encoded`](Self::validate_encoded), telling bytes that do
@@ -237,7 +250,7 @@ impl Validator {
 /// The thread's buffers, lent to one validation.
 struct Scratch<'c> {
     buffer: &'c mut Vec<u8>,
-    spare: &'c mut Vec<Vec<Found>>,
+    spare: &'c mut Vec<Found>,
 }
 
 /// Why a validation did not pass, boxed so that passing, the common case,
@@ -259,11 +272,11 @@ impl Failure {
     }
 }
 
-fn run(plans: &Plans, bytes: &[u8], spare: &mut Vec<Vec<Found>>) -> Result<(), Box<Failure>> {
+fn run(plans: &Plans, bytes: &[u8], spare: &mut Vec<Found>) -> Result<(), Box<Failure>> {
     let mut walker = Walker::new(plans, std::mem::take(spare));
     let root = Msg::new(Src::Bytes(bytes), plans.root, &plans.pool);
     let result = walker.root(&root);
-    *spare = std::mem::take(&mut walker.spare);
+    *spare = std::mem::take(&mut walker.found);
     let error = match result.map_err(|abort| *abort) {
         Ok(()) if walker.violations.is_empty() => return Ok(()),
         Ok(()) => ValidationError {

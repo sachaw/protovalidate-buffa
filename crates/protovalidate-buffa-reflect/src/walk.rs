@@ -47,18 +47,18 @@ pub struct Walker<'a> {
     plans: &'a Plans,
     clock: Clock,
     depth: u32,
-    /// Slot buffers no message is using, one per nesting level reached.
-    pub spare: Vec<Vec<Found>>,
+    /// The slots of the messages being walked, the innermost last.
+    pub found: Vec<Found>,
     pub violations: Vec<Violation>,
 }
 
 impl<'a> Walker<'a> {
-    pub fn new(plans: &'a Plans, spare: Vec<Vec<Found>>) -> Self {
+    pub fn new(plans: &'a Plans, found: Vec<Found>) -> Self {
         Self {
             plans,
             clock: Clock::default(),
             depth: 0,
-            spare,
+            found,
             violations: Vec::new(),
         }
     }
@@ -84,10 +84,10 @@ impl<'a> Walker<'a> {
         let pool = msg.pool;
 
         // One pass over the encoding finds the fields the plan reads.
-        let mut found = self.spare.pop().unwrap_or_default();
-        found.clear();
-        found.resize(plan.slots.len(), Found::EMPTY);
+        let base = self.found.len();
+        self.found.resize(base + plan.slots.len(), Found::EMPTY);
         if !plan.slots.is_empty() {
+            let found = &mut self.found[base..];
             msg.src
                 .visit_at(&mut |n, raw, at| {
                     let Some(route) = plan.dispatch.route(n) else {
@@ -113,8 +113,8 @@ impl<'a> Walker<'a> {
                 })
                 .map_err(|_| Box::new(Abort::Malformed))?;
         }
-        let result = self.fields(plan, msg, &found, path);
-        self.spare.push(found);
+        let result = self.fields(plan, msg, base, path);
+        self.found.truncate(base);
         result
     }
 
@@ -126,41 +126,54 @@ impl<'a> Walker<'a> {
         &mut self,
         plan: &'a MessagePlan,
         msg: &Msg<'a>,
-        found: &[Found],
+        base: usize,
         path: Option<&Path<'_, 'a>>,
     ) -> Result<(), Box<Abort>> {
         let pool = msg.pool;
-        let present = |s: usize| value::present(&found[s], &plan.slots[s].read, &msg.src, pool);
+        let n = plan.slots.len();
+        let present = |found: &[Found], s: usize| {
+            value::present(&found[base + s], &plan.slots[s].read, &msg.src, pool)
+        };
 
         if !plan.rules.is_empty() {
-            let gathered = Gathered {
-                dispatch: &plan.dispatch,
-                found,
-            };
-            let this = Value::Message(Msg {
-                gathered: Some(&gathered),
-                ..msg.clone()
-            });
-            for rule in &plan.rules {
-                match rule.program.passes(&this, &self.clock) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let message = failure(rule, &this, &self.clock);
-                        self.report(
-                            path,
-                            None,
-                            RulePath::Elems(&rule.path),
-                            &rule.id,
-                            message,
-                            false,
-                        );
+            // Failures are reported once the rules no longer read the slots.
+            let mut failed = Vec::new();
+            {
+                let gathered = Gathered {
+                    dispatch: &plan.dispatch,
+                    found: &self.found[base..base + n],
+                };
+                let this = Value::Message(Msg {
+                    gathered: Some(&gathered),
+                    ..msg.clone()
+                });
+                for rule in &plan.rules {
+                    match rule.program.passes(&this, &self.clock) {
+                        Ok(true) => {}
+                        Ok(false) => failed.push((rule, failure(rule, &this, &self.clock))),
+                        Err(e) => {
+                            return Err(Box::new(Abort::Runtime(format!("{}: {e}", rule.id))));
+                        }
                     }
-                    Err(e) => return Err(Box::new(Abort::Runtime(format!("{}: {e}", rule.id)))),
                 }
+            }
+            for (rule, message) in failed {
+                self.report(
+                    path,
+                    None,
+                    RulePath::Elems(&rule.path),
+                    &rule.id,
+                    message,
+                    false,
+                );
             }
         }
         for o in &plan.message_oneofs {
-            let set = o.fields.iter().filter(|&&s| present(s)).count();
+            let set = o
+                .fields
+                .iter()
+                .filter(|&&s| present(&self.found, s))
+                .count();
             let message = if set > 1 {
                 format!("only one of {} can be set", o.names)
             } else if o.required && set == 0 {
@@ -178,7 +191,7 @@ impl<'a> Walker<'a> {
             );
         }
         for (members, name) in &plan.oneofs {
-            if !members.iter().any(|&s| found[s].last.is_some()) {
+            if !members.iter().any(|&s| self.found[base + s].last.is_some()) {
                 self.report(
                     path,
                     Some(name),
@@ -194,7 +207,8 @@ impl<'a> Walker<'a> {
             if let Some(e) = &field.error {
                 return Err(Box::new(Abort::Compile(e.clone())));
             }
-            let present = present(field.slot);
+            let present = present(&self.found, field.slot);
+            let found = self.found[base + field.slot];
             let here = Path {
                 parent: path,
                 elem: &field.elem,
@@ -223,13 +237,26 @@ impl<'a> Walker<'a> {
                 read.wkt,
                 read.shape.card == Card::Singular && field.value.only_message(),
             ) {
-                let src = found[field.slot].message(&msg.src, read.shape.number);
+                let src = found.message(&msg.src, read.shape.number);
                 self.message(child, &Msg::new(src, index, pool), Some(&here))?;
                 continue;
             }
+            if let (true, Card::Singular, Kind::Scalar(_) | Kind::Enum(_)) =
+                (field.value.prim, read.shape.card, read.shape.kind)
+            {
+                let s = match read.shape.kind {
+                    Kind::Scalar(s) => s,
+                    _ => ScalarType::Int32,
+                };
+                let p = found
+                    .last(&msg.src)
+                    .map_or_else(|| value::zero(s), |raw| value::prim(raw, s));
+                self.prim(&field.value, p, &here, false)?;
+                continue;
+            }
             let value = match read.shape.card {
-                Card::Singular => value::singular(&found[field.slot], &msg.src, read, pool),
-                _ => Msg::new(msg.src.within(found[field.slot].span), msg.index, pool).read(read),
+                Card::Singular => value::singular(&found, &msg.src, read, pool),
+                _ => Msg::new(msg.src.within(found.span), msg.index, pool).read(read),
             };
             self.value(&field.value, &value, &here, false)?;
         }
@@ -251,31 +278,12 @@ impl<'a> Walker<'a> {
             match check {
                 Check::Rule(rule) => match rule.program.passes(v, &self.clock) {
                     Ok(true) => {}
-                    Ok(false) => {
-                        let message = failure(rule, v, &self.clock);
-                        self.report(
-                            Some(path),
-                            None,
-                            RulePath::Elems(&rule.path),
-                            &rule.id,
-                            message,
-                            for_key,
-                        );
-                    }
+                    Ok(false) => self.failed(rule, v, path, for_key),
                     Err(e) => return Err(Box::new(Abort::Runtime(format!("{}: {e}", rule.id)))),
                 },
                 Check::DefinedEnum { values, path: rule } => {
-                    if let Value::Int(n) = v
-                        && i32::try_from(*n).is_ok_and(|n| values.binary_search(&n).is_err())
-                    {
-                        self.report(
-                            Some(path),
-                            None,
-                            RulePath::Elems(rule),
-                            "enum.defined_only",
-                            "value must be one of the defined enum values".into(),
-                            for_key,
-                        );
+                    if let Value::Int(n) = v {
+                        self.defined(values, rule, *n, path, for_key);
                     }
                 }
                 Check::AnyIn {
@@ -319,6 +327,76 @@ impl<'a> Walker<'a> {
         Ok(())
     }
 
+    /// [`value`](Self::value), for a plan whose checks all run on scalars.
+    fn prim(
+        &mut self,
+        plan: &'a ValuePlan,
+        p: Prim<'_>,
+        path: &Path<'_, 'a>,
+        for_key: bool,
+    ) -> Result<(), Box<Abort>> {
+        if plan.ignore_zero && p.is_zero() {
+            return Ok(());
+        }
+        for check in &plan.checks {
+            match check {
+                Check::Rule(rule) => match rule.program.passes_prim(p, &self.clock) {
+                    Some(true) => {}
+                    Some(false) => self.failed(rule, &p.value(), path, for_key),
+                    None => {
+                        let v = p.value();
+                        match rule.program.passes(&v, &self.clock) {
+                            Ok(true) => {}
+                            Ok(false) => self.failed(rule, &v, path, for_key),
+                            Err(e) => {
+                                return Err(Box::new(Abort::Runtime(format!("{}: {e}", rule.id))));
+                            }
+                        }
+                    }
+                },
+                Check::DefinedEnum { values, path: rule } => {
+                    if let Prim::Int(n) = p {
+                        self.defined(values, rule, n, path, for_key);
+                    }
+                }
+                Check::AnyIn { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn failed(&mut self, rule: &'a Rule, v: &Value<'_>, path: &Path<'_, 'a>, for_key: bool) {
+        let message = failure(rule, v, &self.clock);
+        self.report(
+            Some(path),
+            None,
+            RulePath::Elems(&rule.path),
+            &rule.id,
+            message,
+            for_key,
+        );
+    }
+
+    fn defined(
+        &mut self,
+        values: &[i32],
+        rule: &'a [Elem],
+        n: i64,
+        path: &Path<'_, 'a>,
+        for_key: bool,
+    ) {
+        if i32::try_from(n).is_ok_and(|n| values.binary_search(&n).is_err()) {
+            self.report(
+                Some(path),
+                None,
+                RulePath::Elems(rule),
+                "enum.defined_only",
+                "value must be one of the defined enum values".into(),
+                for_key,
+            );
+        }
+    }
+
     fn items(
         &mut self,
         plan: &'a ValuePlan,
@@ -327,6 +405,20 @@ impl<'a> Walker<'a> {
     ) -> Result<(), Box<Abort>> {
         let mut result = Ok(());
         let mut i = 0;
+        if plan.prim
+            && list.prims(&mut |item| {
+                let here = Path {
+                    parent: path.parent,
+                    elem: path.elem,
+                    sub: Sub::Index(i),
+                };
+                i += 1;
+                result = self.prim(plan, item, &here, false);
+                result.is_ok()
+            })
+        {
+            return result;
+        }
         list.for_each(&mut |item| {
             let here = Path {
                 parent: path.parent,

@@ -15,6 +15,7 @@ use super::{
 };
 
 /// A compiled expression.
+#[derive(Clone)]
 pub enum Node {
     Const(Const),
     This,
@@ -71,6 +72,7 @@ pub enum Op {
 }
 
 /// A comprehension, one of the macros.
+#[derive(Clone)]
 pub struct Fold {
     pub kind: FoldKind,
     pub range: Node,
@@ -670,6 +672,9 @@ impl Compiler<'_> {
             test,
             transform,
         };
+        if let Some(n) = unroll(&comprehension) {
+            return Ok((n, ty));
+        }
         Ok(fold(Node::Fold(Box::new(comprehension)), ty))
     }
 
@@ -701,6 +706,97 @@ impl Compiler<'_> {
                 (FoldKind::Map, test, Some(transform), Ty::List(Box::new(ty)))
             }
         })
+    }
+}
+
+/// Unrolls `all` or `exists` over a short constant list into a chain of
+/// `&&` or `||`, a copy of the body per item with the item folded in.
+fn unroll(c: &Fold) -> Option<Node> {
+    const MAX: usize = 16;
+    let Node::Const(Const::List(items)) = &c.range else {
+        return None;
+    };
+    let and = match c.kind {
+        FoldKind::All => true,
+        FoldKind::Exists => false,
+        _ => return None,
+    };
+    let test = c.test.as_ref()?;
+    if items.len() > MAX {
+        return None;
+    }
+    let mut out = Node::Const(Const::Bool(and));
+    for item in &**items {
+        let body = refold(test.clone().map(&mut |n| substitute(n, c.var, item)));
+        out = logic(and, out, body);
+    }
+    Some(out)
+}
+
+/// Replaces comprehension variable `var` with `item`.
+fn substitute(n: Node, var: u8, item: &Const) -> Node {
+    match n {
+        Node::Local(v) if v == var => Node::Const(item.clone()),
+        n => n.map(&mut |c| substitute(c, var, item)),
+    }
+}
+
+/// Folds every subexpression whose inputs are now known.
+fn refold(n: Node) -> Node {
+    let n = n.map(&mut refold);
+    fold(n, Ty::Dyn).0
+}
+
+impl Node {
+    /// Rebuilds the node with `f` applied to each node directly below it.
+    #[expect(clippy::many_single_char_names, reason = "a node's parts")]
+    fn map(self, f: &mut impl FnMut(Self) -> Self) -> Self {
+        let mut b = |x: Box<Self>| Box::new(f(*x));
+        match self {
+            Self::Field(x, r) => Self::Field(b(x), r),
+            Self::Has(x, r) => Self::Has(b(x), r),
+            Self::Get(x, n) => Self::Get(b(x), n),
+            Self::HasName(x, n) => Self::HasName(b(x), n),
+            Self::Not(x) => Self::Not(b(x)),
+            Self::Neg(x) => Self::Neg(b(x)),
+            Self::Call1(g, x) => Self::Call1(g, b(x)),
+            Self::Match(x, re) => Self::Match(b(x), re),
+            Self::Size(x, u) => Self::Size(b(x), u),
+            Self::And(xs) => Self::And(Box::new(xs.map(&mut *f))),
+            Self::Or(xs) => Self::Or(Box::new(xs.map(&mut *f))),
+            Self::Op(o, xs) => Self::Op(o, Box::new(xs.map(&mut *f))),
+            Self::Cond(xs) => Self::Cond(Box::new(xs.map(&mut *f))),
+            Self::List(xs) => Self::List(xs.into_vec().into_iter().map(&mut *f).collect()),
+            Self::Call(g, xs) => Self::Call(g, xs.into_vec().into_iter().map(&mut *f).collect()),
+            Self::Map(es) => Self::Map(
+                es.into_vec()
+                    .into_iter()
+                    .map(|(k, v)| (f(k), f(v)))
+                    .collect(),
+            ),
+            Self::Compare(o, x) => {
+                let (n, c) = *x;
+                Self::Compare(o, Box::new((f(n), c)))
+            }
+            Self::Choose(x) => {
+                let (n, a, c) = *x;
+                Self::Choose(Box::new((f(n), a, c)))
+            }
+            Self::Fold(c) => {
+                let c = *c;
+                Self::Fold(Box::new(Fold {
+                    range: f(c.range),
+                    test: c.test.map(&mut *f),
+                    transform: c.transform.map(&mut *f),
+                    ..c
+                }))
+            }
+            n @ (Self::Const(_)
+            | Self::This
+            | Self::Now
+            | Self::Local(_)
+            | Self::CompareThis(..)) => n,
+        }
     }
 }
 

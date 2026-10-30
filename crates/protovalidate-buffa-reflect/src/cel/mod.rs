@@ -30,7 +30,7 @@ use std::{borrow::Cow, cell::Cell, fmt, sync::Arc};
 use buffa_descriptor::DescriptorPool;
 use chrono::{DateTime, Utc};
 pub use types::Ty;
-use value::{Const, Str, Value};
+use value::{Const, Prim, Str, Value};
 
 /// An evaluation error: CEL's error value, reported as a runtime error.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,6 +119,12 @@ impl Program {
                 Self(
                     pred::Check::from_node(&n).map_or(Kind::Native(n, locals), |mut check| {
                         check.typed = typed::compile(&check.pred, &bindings.this);
+                        check.scalar = check.typed.is_some()
+                            && check.pred.this_only()
+                            && matches!(
+                                bindings.this,
+                                Ty::Int | Ty::Uint | Ty::Double | Ty::Bool | Ty::String | Ty::Bytes
+                            );
                         Kind::Check(check)
                     }),
                 )
@@ -136,9 +142,13 @@ impl Program {
     pub fn passes<'a>(&'a self, this: &Value<'a>, clock: &Clock) -> Result<bool, Box<Error>> {
         match &self.0 {
             Kind::Check(check) => {
-                let held = match check.typed.as_ref().and_then(|test| test(this)) {
+                let held = match check
+                    .typed
+                    .as_ref()
+                    .and_then(|test| test(typed::Arg::Value(this), clock))
+                {
                     Some(held) => held,
-                    None => check.pred.eval(this).map_err(Box::new)?,
+                    None => check.pred.eval(this, clock).map_err(Box::new)?,
                 };
                 Ok(held != check.fails_when)
             }
@@ -149,12 +159,40 @@ impl Program {
         }
     }
 
+    /// Whether a scalar `this` passes, when the expression is a native check
+    /// of `this` alone; `None` otherwise.
+    #[inline]
+    pub fn passes_prim(&self, this: Prim<'_>, clock: &Clock) -> Option<bool> {
+        match &self.0 {
+            Kind::Check(check) if check.scalar => check
+                .typed
+                .as_ref()
+                .and_then(|test| test(typed::Arg::Prim(this), clock))
+                .map(|held| held != check.fails_when),
+            _ => None,
+        }
+    }
+
+    /// Whether the expression runs as a native check.
+    pub const fn is_native(&self) -> bool {
+        matches!(&self.0, Kind::Check(check) if check.typed.is_some())
+    }
+
+    /// Whether [`passes_prim`](Self::passes_prim) can decide.
+    pub const fn is_scalar(&self) -> bool {
+        matches!(&self.0, Kind::Check(check) if check.scalar)
+    }
+
     pub fn eval<'a>(&'a self, this: &Value<'a>, clock: &Clock) -> Result<Outcome<'a>, Error> {
         let result = match &self.0 {
             Kind::Check(check) => {
-                let held = match check.typed.as_ref().and_then(|test| test(this)) {
+                let held = match check
+                    .typed
+                    .as_ref()
+                    .and_then(|test| test(typed::Arg::Value(this), clock))
+                {
                     Some(held) => held,
-                    None => check.pred.eval(this)?,
+                    None => check.pred.eval(this, clock)?,
                 };
                 return Ok(if held == check.fails_when {
                     Outcome::Fail(check.message.as_deref().map(Str::Ref))

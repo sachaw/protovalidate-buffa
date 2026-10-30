@@ -45,6 +45,8 @@ pub struct Elem {
 /// Every message plan reached from one root type.
 pub struct Plans {
     pub messages: Vec<MessagePlan>,
+    /// The standard rules that do not run as native checks, by id.
+    pub interpreted: Vec<Box<str>>,
     pub root: MessageIndex,
     /// The pool the plans index into, which this keeps alive.
     pub pool: Arc<DescriptorPool>,
@@ -99,6 +101,9 @@ pub struct ValuePlan {
     pub message: Option<usize>,
     pub items: Option<Box<Self>>,
     pub entries: Option<Box<(Self, Self)>>,
+    /// Every check is a native check of a scalar, which runs on the scalar
+    /// read off the wire, with no CEL value.
+    pub prim: bool,
 }
 
 pub enum Check {
@@ -305,6 +310,7 @@ enum Site {
 
 pub struct Builder<'p> {
     pool: &'p Arc<DescriptorPool>,
+    interpreted: std::cell::RefCell<Vec<Box<str>>>,
     schema: Option<Schema>,
     plans: Vec<MessagePlan>,
     index: HashMap<MessageIndex, usize>,
@@ -314,6 +320,7 @@ impl<'p> Builder<'p> {
     pub fn new(pool: &'p Arc<DescriptorPool>) -> Self {
         Self {
             pool,
+            interpreted: std::cell::RefCell::default(),
             schema: Schema::of(pool),
             plans: Vec::new(),
             index: HashMap::new(),
@@ -333,6 +340,7 @@ impl<'p> Builder<'p> {
             messages: self.plans,
             root,
             pool: Arc::clone(self.pool),
+            interpreted: self.interpreted.into_inner(),
         }
     }
 
@@ -788,6 +796,9 @@ impl<'p> Builder<'p> {
                         )
                     })?
                 {
+                    if !rule.program.is_native() && !rule_elem.name.starts_with('[') {
+                        self.interpreted.borrow_mut().push(rule.id.clone());
+                    }
                     plan.checks.push(Check::Rule(rule));
                 }
             }
@@ -940,6 +951,25 @@ fn value_live(v: &ValuePlan, live: &[bool]) -> bool {
             .is_some_and(|e| value_live(&e.0, live) || value_live(&e.1, live))
 }
 
+/// Marks the value plans whose checks all run on scalars.
+fn mark_prim(v: &mut ValuePlan) {
+    v.prim = v.message.is_none()
+        && v.items.is_none()
+        && v.entries.is_none()
+        && v.checks.iter().all(|c| match c {
+            Check::Rule(r) => r.program.is_scalar(),
+            Check::DefinedEnum { .. } => true,
+            Check::AnyIn { .. } => false,
+        });
+    if let Some(items) = &mut v.items {
+        mark_prim(items);
+    }
+    if let Some(entries) = &mut v.entries {
+        mark_prim(&mut entries.0);
+        mark_prim(&mut entries.1);
+    }
+}
+
 fn prune_value(v: &mut ValuePlan, live: &[bool]) {
     if v.message.is_some_and(|m| !live[m]) {
         v.message = None;
@@ -1001,6 +1031,7 @@ fn layout(plan: &mut MessagePlan, md: &MessageDescriptor, pool: &DescriptorPool)
     };
     for field in &mut plan.fields {
         field.slot = slot(field.slot, &mut by_field);
+        mark_prim(&mut field.value);
     }
     let mut read = Vec::new();
     for rule in &plan.rules {

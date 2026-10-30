@@ -21,6 +21,7 @@ connectrpc = { version = "0.9", default-features = false, optional = true }
 futures-util = { version = "0.3", default-features = false, optional = true }
 protovalidate-buffa = { path = "../protovalidate-buffa", version = "0.7.2", default-features = false }
 regex = "1"
+regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-search", "std", "syntax", "unicode", "perf"] }
 
 [features]
 default = []

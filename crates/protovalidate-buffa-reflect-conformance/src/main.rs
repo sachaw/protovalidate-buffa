@@ -113,6 +113,15 @@ fn run(
         );
         return Ok(result);
     };
+    // Every standard rule runs as a native check, not on the interpreter.
+    let interpreted = validator.interpreted_rules(cases, index);
+    if !interpreted.is_empty() {
+        set(
+            "unexpected_error",
+            Value::String(format!("interpreted standard rules: {interpreted:?}")),
+        );
+        return Ok(result);
+    }
     match validator.validate_encoded(cases, index, bytes) {
         Ok(()) => set("success", Value::Bool(true)),
         Err(e) if e.compile_error.is_some() => {
