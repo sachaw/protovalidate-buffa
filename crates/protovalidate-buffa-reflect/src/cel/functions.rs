@@ -487,7 +487,11 @@ fn hash(item: &Value<'_>) -> Result<Option<u64>, Error> {
         Value::Bytes(b) => Some(bytes(b)),
         other => key(other)?.map(|k| match k {
             Key::Bool(b) => u64::from(b),
-            #[expect(clippy::cast_possible_truncation, reason = "a hash")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a hash"
+            )]
             Key::Int(i) => (i as u64) ^ ((i >> 64) as u64),
             Key::Double(d) => d,
             Key::Bytes(b) => bytes(&b),
@@ -511,7 +515,7 @@ fn key(item: &Value<'_>) -> Result<Option<Key>, Error> {
         Value::Double(d) => Key::Double(d.to_bits()),
         Value::String(s) => Key::Bytes(s.as_bytes().to_vec()),
         Value::Bytes(b) => Key::Bytes(b.to_vec()),
-        other => return Err(overload("unique", &[other.clone()])),
+        other => return Err(overload("unique", std::slice::from_ref(other))),
     }))
 }
 

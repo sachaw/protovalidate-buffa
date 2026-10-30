@@ -75,7 +75,6 @@ fn message<'v, 'a>(v: &'v Value<'a>) -> Result<&'v Msg<'a>, Error> {
     }
 }
 
-#[expect(clippy::many_single_char_names, reason = "an evaluator's operands")]
 fn eval<'a>(node: &'a Node, f: &mut Frame<'a, '_, '_>) -> Result<Value<'a>, Error> {
     Ok(match node {
         Node::Const(c) => Value::from_const(c),

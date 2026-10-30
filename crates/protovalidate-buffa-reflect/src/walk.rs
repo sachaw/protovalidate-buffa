@@ -118,6 +118,10 @@ impl<'a> Walker<'a> {
         result
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "a message's checks, in the order they report"
+    )]
     fn fields(
         &mut self,
         plan: &'a MessagePlan,

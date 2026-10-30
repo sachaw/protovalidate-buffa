@@ -33,6 +33,7 @@ pub enum Raw<'a> {
     Group(&'a [u8]),
 }
 
+#[expect(clippy::inline_always, reason = "the one-byte case, on every field")]
 #[inline(always)]
 fn varint(buf: &mut &[u8]) -> Result<u64, Malformed> {
     if let Some((&b, rest)) = buf.split_first()
@@ -57,7 +58,7 @@ fn long_varint(buf: &mut &[u8]) -> Result<u64, Malformed> {
     Err(Malformed)
 }
 
-fn take<'a>(buf: &mut &'a [u8], n: usize) -> Result<&'a [u8], Malformed> {
+const fn take<'a>(buf: &mut &'a [u8], n: usize) -> Result<&'a [u8], Malformed> {
     if buf.len() < n {
         return Err(Malformed);
     }
@@ -67,7 +68,10 @@ fn take<'a>(buf: &mut &'a [u8], n: usize) -> Result<&'a [u8], Malformed> {
 }
 
 /// Reads one field: its number and value. A group is read to its end tag.
-// Inlined into each loop, so the field is not returned through memory.
+#[expect(
+    clippy::inline_always,
+    reason = "inlined into each loop, the field is not returned through memory"
+)]
 #[inline(always)]
 fn field<'a>(buf: &mut &'a [u8], depth: u32) -> Result<(u32, Raw<'a>), Malformed> {
     let tag = varint(buf)?;
@@ -280,8 +284,8 @@ impl Kind {
     #[inline]
     pub fn accepts(self, raw: Raw<'_>, pool: &DescriptorPool) -> bool {
         match (self, raw) {
-            (Self::Message(_), Raw::Len(_) | Raw::Group(_)) => true,
-            (Self::Enum(None), Raw::Varint(_)) => true,
+            (Self::Message(_), Raw::Len(_) | Raw::Group(_))
+            | (Self::Enum(None), Raw::Varint(_)) => true,
             (Self::Enum(Some(e)), Raw::Varint(v)) => known(pool, e, v),
             (Self::Scalar(s), raw) => matches!(
                 (wire(s), raw),
@@ -388,9 +392,8 @@ impl Shape {
             Kind::Scalar(s) => 1 << wire(s),
         };
         match self.card {
-            Card::Singular => element,
             Card::List if self.kind.packable() => element | 1 << 2,
-            Card::List => element,
+            Card::Singular | Card::List => element,
             Card::Map(_) => 1 << 2,
         }
     }
@@ -500,6 +503,7 @@ impl Found {
     };
 
     /// Takes the occurrence of field `number` found at `at`.
+    #[expect(clippy::inline_always, reason = "once per field read in a walk")]
     #[inline(always)]
     pub fn take(&mut self, raw: Raw<'_>, at: Range<usize>, number: u32) {
         let (start, end) = (
@@ -517,7 +521,7 @@ impl Found {
 
     /// A sibling oneof member was set.
     #[inline]
-    pub fn clear(&mut self) {
+    pub const fn clear(&mut self) {
         self.last = None;
         self.count = 0;
     }
@@ -569,16 +573,6 @@ pub fn elements<'a>(
     pool: &DescriptorPool,
     f: &mut dyn FnMut(Raw<'a>) -> bool,
 ) -> Result<(), Malformed> {
-    #[derive(Debug)]
-    enum Stop {
-        Done,
-        Malformed,
-    }
-    impl From<Malformed> for Stop {
-        fn from(_: Malformed) -> Self {
-            Self::Malformed
-        }
-    }
     let result = src.visit(&mut |n, raw| {
         if n != number {
             return Ok(());
@@ -600,33 +594,46 @@ pub fn elements<'a>(
             _ => Ok(()),
         }
     });
-    fn each_packed<'a>(
-        packed: &mut &'a [u8],
-        wire: u8,
-        kind: Kind,
-        pool: &DescriptorPool,
-        f: &mut dyn FnMut(Raw<'a>) -> bool,
-    ) -> Result<(), Stop> {
-        while !packed.is_empty() {
-            let raw = match wire {
-                1 => Raw::I64(u64::from_le_bytes(
-                    take(packed, 8)?.try_into().map_err(|_| Malformed)?,
-                )),
-                5 => Raw::I32(u32::from_le_bytes(
-                    take(packed, 4)?.try_into().map_err(|_| Malformed)?,
-                )),
-                _ => Raw::Varint(varint(packed)?),
-            };
-            if kind.accepts(raw, pool) && !f(raw) {
-                return Err(Stop::Done);
-            }
-        }
-        Ok(())
-    }
     match result {
         Ok(()) | Err(Stop::Done) => Ok(()),
         Err(Stop::Malformed) => Err(Malformed),
     }
+}
+
+/// Why a visit of elements ended early.
+enum Stop {
+    Done,
+    Malformed,
+}
+
+impl From<Malformed> for Stop {
+    fn from(_: Malformed) -> Self {
+        Self::Malformed
+    }
+}
+
+fn each_packed<'a>(
+    packed: &mut &'a [u8],
+    wire: u8,
+    kind: Kind,
+    pool: &DescriptorPool,
+    f: &mut dyn FnMut(Raw<'a>) -> bool,
+) -> Result<(), Stop> {
+    while !packed.is_empty() {
+        let raw = match wire {
+            1 => Raw::I64(u64::from_le_bytes(
+                take(packed, 8)?.try_into().map_err(|_| Malformed)?,
+            )),
+            5 => Raw::I32(u32::from_le_bytes(
+                take(packed, 4)?.try_into().map_err(|_| Malformed)?,
+            )),
+            _ => Raw::Varint(varint(packed)?),
+        };
+        if kind.accepts(raw, pool) && !f(raw) {
+            return Err(Stop::Done);
+        }
+    }
+    Ok(())
 }
 
 /// A map entry: its key and value as the decoder reads them.

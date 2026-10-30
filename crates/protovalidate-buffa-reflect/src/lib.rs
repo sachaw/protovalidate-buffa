@@ -138,7 +138,7 @@ impl Validator {
             encode(scratch.buffer);
             run(plans, scratch.buffer, scratch.spare)
         })
-        .map_err(|f| f.into_error(md))
+        .map_err(|f| (*f).into_error(md))
     }
 
     /// Validates an encoded message of type `message` in `pool`, without
@@ -161,7 +161,7 @@ impl Validator {
     ) -> Result<(), ValidationError> {
         let md = pool.message(message);
         self.with_cache(md, pool, |plans, scratch| run(plans, bytes, scratch.spare))
-            .map_err(|f| f.into_error(md))
+            .map_err(|f| (*f).into_error(md))
     }
 
     /// [`validate_encoded`](Self::validate_encoded), telling bytes that do
@@ -244,8 +244,8 @@ enum Failure {
 }
 
 impl Failure {
-    fn into_error(self: Box<Self>, md: &MessageDescriptor) -> ValidationError {
-        match *self {
+    fn into_error(self, md: &MessageDescriptor) -> ValidationError {
+        match self {
             Self::Invalid(e) => e,
             Self::Malformed => ValidationError {
                 runtime_error: Some(format!("malformed encoding of {}", md.full_name())),

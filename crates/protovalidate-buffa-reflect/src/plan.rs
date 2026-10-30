@@ -723,7 +723,7 @@ impl<'p> Builder<'p> {
                     values.sort_unstable();
                     let mut path = prefix.to_vec();
                     path.push(type_elem.clone());
-                    path.push(rule_elem.clone());
+                    path.push(rule_elem);
                     plan.checks.push(Check::DefinedEnum {
                         values: values.into(),
                         path: path.into(),
@@ -753,7 +753,7 @@ impl<'p> Builder<'p> {
                 if let (false, Some(url)) = (urls.is_empty(), url) {
                     let mut path = prefix.to_vec();
                     path.push(type_elem.clone());
-                    path.push(rule_elem.clone());
+                    path.push(rule_elem);
                     plan.checks.push(Check::AnyIn {
                         url,
                         urls: urls.into(),
@@ -981,14 +981,16 @@ fn layout(plan: &mut MessagePlan, md: &MessageDescriptor, pool: &DescriptorPool)
         }
         // Setting a oneof member clears the others, so a slot for one is a
         // slot for all.
-        let members: Vec<usize> = match md.fields()[f].oneof_index() {
-            Some(o) => md.oneofs()[usize::from(o)]
-                .field_indices()
-                .iter()
-                .map(|&i| usize::from(i))
-                .collect(),
-            None => vec![f],
-        };
+        let members: Vec<usize> = md.fields()[f].oneof_index().map_or_else(
+            || vec![f],
+            |o| {
+                md.oneofs()[usize::from(o)]
+                    .field_indices()
+                    .iter()
+                    .map(|&i| usize::from(i))
+                    .collect()
+            },
+        );
         for m in members {
             if by_field[m].is_none() {
                 by_field[m] = Some(order.len());
@@ -1019,16 +1021,15 @@ fn layout(plan: &mut MessagePlan, md: &MessageDescriptor, pool: &DescriptorPool)
         .iter()
         .map(|&f| {
             let fd = &md.fields()[f];
-            let siblings = match fd.oneof_index() {
-                Some(o) => md.oneofs()[usize::from(o)]
+            let siblings = fd.oneof_index().map_or_else(Box::default, |o| {
+                md.oneofs()[usize::from(o)]
                     .field_indices()
                     .iter()
                     .map(|&i| usize::from(i))
                     .filter(|&i| i != f)
                     .filter_map(|i| by_field[i])
-                    .collect(),
-                None => Box::default(),
-            };
+                    .collect()
+            });
             Slot {
                 read: Read::of(md, fd, pool),
                 siblings,

@@ -248,22 +248,18 @@ impl<'a> Msg<'a> {
     /// A singular field's occurrences.
     #[inline]
     pub fn found(&self, read: &Read) -> Found {
-        match self.gathered(read.shape.number) {
-            Some(found) => *found,
-            None => wire::singular(&self.src, &read.shape, self.pool).unwrap_or_default(),
-        }
+        self.gathered(read.shape.number).map_or_else(
+            || wire::singular(&self.src, &read.shape, self.pool).unwrap_or_default(),
+            |found| *found,
+        )
     }
 
     /// A singular scalar field's value; an enum's number is an int.
     #[inline]
     pub fn prim(&self, read: &Read, s: ScalarType) -> Prim<'a> {
-        let last = match self.gathered(read.shape.number) {
-            Some(found) => found.last(&self.src),
-            None => wire::singular(&self.src, &read.shape, self.pool)
-                .ok()
-                .and_then(|f| f.last(&self.src)),
-        };
-        last.map_or(zero(s), |raw| prim(raw, s))
+        self.found(read)
+            .last(&self.src)
+            .map_or_else(|| zero(s), |raw| prim(raw, s))
     }
 
     /// A singular message field, merged from its occurrences.
@@ -281,16 +277,10 @@ impl<'a> Msg<'a> {
     #[inline]
     pub fn read(&self, read: &Read) -> Value<'a> {
         let shape = &read.shape;
-        let gathered = self.gathered(shape.number);
         if shape.card == Card::Singular {
-            return match gathered {
-                Some(found) => singular(found, &self.src, read, self.pool),
-                None => {
-                    let found = wire::singular(&self.src, shape, self.pool).unwrap_or_default();
-                    singular(&found, &self.src, read, self.pool)
-                }
-            };
+            return singular(&self.found(read), &self.src, read, self.pool);
         }
+        let gathered = self.gathered(shape.number);
         let field = Field {
             src: gathered.map_or_else(|| self.src.clone(), |f| self.src.within(f.span)),
             number: shape.number,
@@ -405,7 +395,6 @@ pub fn singular<'a>(
 /// One occurrence's value: a scalar, or one message (not merged).
 #[inline]
 #[expect(clippy::cast_possible_truncation, reason = "the wire's truncations")]
-#[expect(clippy::cast_possible_wrap, reason = "the wire's reinterpretations")]
 pub fn element<'a>(
     raw: Raw<'a>,
     kind: Kind,
@@ -441,7 +430,9 @@ pub enum Prim<'a> {
 pub fn prim(raw: Raw<'_>, s: ScalarType) -> Prim<'_> {
     match (s, raw) {
         (ScalarType::Int32, Raw::Varint(v)) => Prim::Int(i64::from(v as i32)),
-        (ScalarType::Int64, Raw::Varint(v)) => Prim::Int(v as i64),
+        (ScalarType::Int64, Raw::Varint(v)) | (ScalarType::Sfixed64, Raw::I64(v)) => {
+            Prim::Int(v as i64)
+        }
         (ScalarType::Uint32, Raw::Varint(v)) => Prim::Uint(u64::from(v as u32)),
         (ScalarType::Uint64, Raw::Varint(v)) | (ScalarType::Fixed64, Raw::I64(v)) => Prim::Uint(v),
         (ScalarType::Sint32, Raw::Varint(v)) => {
@@ -450,7 +441,6 @@ pub fn prim(raw: Raw<'_>, s: ScalarType) -> Prim<'_> {
         }
         (ScalarType::Sint64, Raw::Varint(v)) => Prim::Int((v >> 1) as i64 ^ -((v & 1) as i64)),
         (ScalarType::Bool, Raw::Varint(v)) => Prim::Bool(v != 0),
-        (ScalarType::Sfixed64, Raw::I64(v)) => Prim::Int(v as i64),
         (ScalarType::Double, Raw::I64(v)) => Prim::Double(f64::from_bits(v)),
         (ScalarType::Fixed32, Raw::I32(v)) => Prim::Uint(u64::from(v)),
         (ScalarType::Sfixed32, Raw::I32(v)) => Prim::Int(i64::from(v as i32)),
@@ -520,11 +510,9 @@ impl<'a> Prim<'a> {
 
 /// A string field's bytes as a string.
 pub fn utf8(b: &[u8]) -> Str<'_> {
-    match std::str::from_utf8(b) {
-        Ok(s) => Str::Ref(s),
-        // Not a valid encoding, which decoding rejects; read leniently.
-        Err(_) => Str::Rc(String::from_utf8_lossy(b).into()),
-    }
+    // Invalid UTF-8 is not a valid encoding, which decoding rejects; it is
+    // read leniently.
+    std::str::from_utf8(b).map_or_else(|_| Str::Rc(String::from_utf8_lossy(b).into()), Str::Ref)
 }
 
 /// A scalar occurrence's value.
@@ -648,7 +636,10 @@ impl<'a> Field<'a> {
         let Card::Map(key) = self.card else {
             return;
         };
-        let key_of = |e: &wire::Entry<'a>| e.key.map_or(default_scalar(key), |k| scalar(k, key));
+        let key_of = |e: &wire::Entry<'a>| {
+            e.key
+                .map_or_else(|| default_scalar(key), |k| scalar(k, key))
+        };
         let value_read = Read {
             shape: Shape::entry(2, self.kind),
             wkt: self.wkt,
@@ -662,7 +653,7 @@ impl<'a> Field<'a> {
         let _ = wire::entries(&self.src, number, key, kind, self.pool, &mut |e| {
             let h = e
                 .key
-                .map_or(zero(key), |k| prim(k, key))
+                .map_or_else(|| zero(key), |k| prim(k, key))
                 .hash()
                 .wrapping_mul(0x9E37_79B9_7F4A_7C15);
             let (word, bit) = ((h >> 62) as usize, 1 << ((h >> 56) & 63));

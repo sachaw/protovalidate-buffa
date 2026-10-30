@@ -27,6 +27,7 @@ pub type Test = Box<dyn for<'a> Fn(&Value<'a>) -> Option<bool> + Send + Sync>;
 
 type Get<T> = Box<dyn for<'a> Fn(&Value<'a>) -> Option<T> + Send + Sync>;
 type GetStr = Box<dyn for<'a> Fn(&Value<'a>) -> Option<Str<'a>> + Send + Sync>;
+type GetBytes = Box<dyn for<'a> Fn(&Value<'a>) -> Option<&'a [u8]> + Send + Sync>;
 
 /// What an operand holds, when it is a scalar.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,11 @@ enum Of {
     Bytes,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    reason = "an arm per predicate, over its operands"
+)]
 pub fn compile(p: &Pred, this: &Ty) -> Option<Test> {
     Some(match p {
         Pred::Compare(x, op, c) => {
@@ -99,7 +105,7 @@ pub fn compile(p: &Pred, this: &Ty) -> Option<Test> {
                 }
                 Of::Bytes => {
                     let (a, b) = (bytes(x)?, bytes(y)?);
-                    Box::new(move |v| Some(decide(op, Some((*a(v)?).cmp(&*b(v)?)))))
+                    Box::new(move |v| Some(decide(op, Some(a(v)?.cmp(b(v)?)))))
                 }
             }
         }
@@ -253,9 +259,10 @@ pub fn compile(p: &Pred, this: &Ty) -> Option<Test> {
 #[inline]
 const fn decide(op: Op, order: Option<Ordering>) -> bool {
     match (op, order) {
-        (Op::Eq, Some(Ordering::Equal)) | (Op::Ne, None) => true,
         (Op::Ne, Some(o)) => !matches!(o, Ordering::Equal),
-        (Op::Lt, Some(Ordering::Less))
+        (Op::Eq, Some(Ordering::Equal))
+        | (Op::Ne, None)
+        | (Op::Lt, Some(Ordering::Less))
         | (Op::Le, Some(Ordering::Less | Ordering::Equal))
         | (Op::Gt, Some(Ordering::Greater))
         | (Op::Ge, Some(Ordering::Greater | Ordering::Equal)) => true,
@@ -269,29 +276,23 @@ fn all<T>(items: &[Const], f: impl Fn(&Const) -> Option<T>) -> Option<Box<[T]>> 
 
 /// The scalar an operand holds.
 fn of(x: &Operand, this: &Ty) -> Option<Of> {
-    match x.0.last() {
-        None => match this {
-            Ty::Int => Some(Of::Int),
-            Ty::Uint => Some(Of::Uint),
-            Ty::Double => Some(Of::Double),
-            Ty::Bool => Some(Of::Bool),
-            Ty::String => Some(Of::Str),
-            Ty::Bytes => Some(Of::Bytes),
-            _ => None,
-        },
-        Some(read) => scalar(read).map(|s| match Ty::of_scalar(s) {
-            Ty::Int => Of::Int,
-            Ty::Uint => Of::Uint,
-            Ty::Double => Of::Double,
-            Ty::Bool => Of::Bool,
-            Ty::String => Of::Str,
-            _ => Of::Bytes,
-        }),
-    }
+    let ty = match x.0.last() {
+        None => this.clone(),
+        Some(read) => Ty::of_scalar(scalar(read)?),
+    };
+    Some(match ty {
+        Ty::Int => Of::Int,
+        Ty::Uint => Of::Uint,
+        Ty::Double => Of::Double,
+        Ty::Bool => Of::Bool,
+        Ty::String => Of::Str,
+        Ty::Bytes => Of::Bytes,
+        _ => return None,
+    })
 }
 
 /// A singular scalar field's type; an enum reads as an int32.
-fn scalar(read: &Read) -> Option<ScalarType> {
+const fn scalar(read: &Read) -> Option<ScalarType> {
     match (read.shape.card, read.shape.kind) {
         (Card::Singular, Kind::Scalar(s)) => Some(s),
         (Card::Singular, Kind::Enum(_)) => Some(ScalarType::Int32),
@@ -343,7 +344,7 @@ fn read<T: 'static>(
     Some(Box::new(move |v| conv(get(v)?.prim(&last, s))))
 }
 
-fn this_prim<'a>(v: &Value<'a>) -> Option<Prim<'a>> {
+const fn this_prim<'a>(v: &Value<'a>) -> Option<Prim<'a>> {
     match v {
         Value::Int(i) => Some(Prim::Int(*i)),
         Value::Uint(u) => Some(Prim::Uint(*u)),
@@ -404,7 +405,7 @@ fn string(x: &Operand) -> Option<GetStr> {
     }))
 }
 
-fn bytes(x: &Operand) -> Option<Box<dyn for<'a> Fn(&Value<'a>) -> Option<&'a [u8]> + Send + Sync>> {
+fn bytes(x: &Operand) -> Option<GetBytes> {
     let Some((last, path)) = x.0.split_last() else {
         return Some(Box::new(|v| match v {
             Value::Bytes(Bin::Ref(b)) => Some(b),
