@@ -155,7 +155,7 @@ impl<'a> Walker<'a> {
             if field.skip_unset && !present {
                 continue;
             }
-            let value = msg.field(field.index);
+            let value = msg.read(field.index, field.read, Some(present));
             self.value(&field.value, &value, &here, false)?;
         }
         Ok(())

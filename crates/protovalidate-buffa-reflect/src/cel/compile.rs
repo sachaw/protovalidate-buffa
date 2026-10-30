@@ -11,7 +11,7 @@ use regex::Regex;
 use super::{
     Bindings, eval,
     types::Ty,
-    value::{Const, Type},
+    value::{Const, Read, Type},
 };
 
 /// A compiled expression.
@@ -21,7 +21,7 @@ pub enum Node {
     Now,
     Local(u8),
     /// A field of a message whose type is known, by index.
-    Field(Box<Self>, u32),
+    Field(Box<Self>, u32, Read),
     /// `has()` of a field of a message whose type is known, by index.
     Has(Box<Self>, u32),
     /// A field, or a map entry, by name, resolved when it runs.
@@ -37,6 +37,20 @@ pub enum Node {
     Map(Box<[(Self, Self)]>),
     Call(Func, Box<[Self]>),
     Fold(Box<Fold>),
+    // Fused forms of the shapes standard rules fold to, each evaluated in one
+    // visit rather than one per node.
+    /// A comparison of `this` against a constant.
+    CompareThis(Op, Box<Const>),
+    /// A comparison against a constant.
+    Compare(Op, Box<(Self, Const)>),
+    /// `cond ? a : b` where both branches are constants.
+    Choose(Box<(Self, Const, Const)>),
+    /// A function of one argument.
+    Call1(Func, Box<Self>),
+    /// `matches()` against a pattern compiled once.
+    Match(Box<Self>, Box<Regex>),
+    /// `int(size(x))` or, when true, `uint(size(x))`.
+    Size(Box<Self>, bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,7 +91,7 @@ pub enum FoldKind {
 }
 
 /// The functions the tree evaluates itself. Receivers are the first argument.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Func {
     Size,
     StartsWith,
@@ -144,15 +158,17 @@ pub enum Refusal {
 
 type Result<T> = std::result::Result<T, Refusal>;
 
-const MAX_LOCALS: u8 = 8;
+#[expect(clippy::cast_possible_truncation, reason = "a small constant")]
+const MAX_LOCALS: u8 = eval::LOCALS as u8;
 
 /// Lowers `e`. `Ok(None)` when the expression folds to a pass.
-pub fn compile(e: &IdedExpr, bindings: &Bindings<'_>) -> Result<Option<Node>> {
+pub fn compile(e: &IdedExpr, bindings: &Bindings<'_>) -> Result<Option<(Node, usize)>> {
     let mut cx = Compiler {
         pool: bindings.pool,
         bindings,
         locals: Vec::new(),
         next: 0,
+        used: 0,
     };
     let (node, ty) = cx.expr(e)?;
     if !matches!(ty, Ty::Bool | Ty::String | Ty::Dyn) {
@@ -164,7 +180,7 @@ pub fn compile(e: &IdedExpr, bindings: &Bindings<'_>) -> Result<Option<Node>> {
     Ok(match node {
         Node::Const(Const::Bool(true)) => None,
         Node::Const(Const::String(s)) if s.is_empty() => None,
-        node => Some(node),
+        node => Some((node, usize::from(cx.used))),
     })
 }
 
@@ -173,6 +189,8 @@ struct Compiler<'b> {
     bindings: &'b Bindings<'b>,
     locals: Vec<(String, Ty, u8)>,
     next: u8,
+    /// The most comprehension variables bound at once.
+    used: u8,
 }
 
 fn error<T>(message: impl Into<String>) -> Result<T> {
@@ -269,7 +287,7 @@ impl Compiler<'_> {
                     self.fold(Node::Has(Box::new(operand), index), Ty::Bool)
                 } else {
                     self.fold(
-                        Node::Field(Box::new(operand), index),
+                        Node::Field(Box::new(operand), index, Read::of(fd, self.pool)),
                         Ty::of_field(fd, self.pool),
                     )
                 })
@@ -337,7 +355,13 @@ impl Compiler<'_> {
                 Ok(match p {
                     Node::Const(Const::Bool(true)) => (t, ty),
                     Node::Const(Const::Bool(false)) => (f, ty),
-                    p => self.fold(Node::Cond(Box::new([p, t, f])), ty),
+                    p => match (t, f) {
+                        (Node::Const(t), Node::Const(f)) => match p {
+                            Node::Not(p) => self.fold(Node::Choose(Box::new((*p, f, t))), ty),
+                            p => self.fold(Node::Choose(Box::new((p, t, f))), ty),
+                        },
+                        (t, f) => self.fold(Node::Cond(Box::new([p, t, f])), ty),
+                    },
                 })
             }
             (
@@ -361,7 +385,7 @@ impl Compiler<'_> {
                 let (b, bt) = self.expr(&c.args[1])?;
                 let o = binary_op(name);
                 let ty = self.binary_type(name, o, &at, &bt)?;
-                Ok(self.fold(Node::Op(o, Box::new([a, b])), ty))
+                Ok(self.fold(binary(o, a, b), ty))
             }
             ("dyn", false, 1) => {
                 let (a, _) = self.expr(&c.args[0])?;
@@ -376,7 +400,7 @@ impl Compiler<'_> {
         let Some(func) = function(&c.func_name, member) else {
             return Err(Refusal::Unsupported);
         };
-        let mut args = Vec::with_capacity(c.args.len() + 1);
+        let mut args: Vec<Node> = Vec::with_capacity(c.args.len() + 1);
         let mut tys = Vec::with_capacity(c.args.len() + 1);
         for x in c.target.iter().map(|t| &**t).chain(&c.args) {
             let (n, t) = self.expr(x)?;
@@ -396,7 +420,19 @@ impl Compiler<'_> {
             },
             f => f,
         };
-        Ok(self.fold(Node::Call(func, args.into()), ty))
+        let node = match (func, args.len()) {
+            (Func::Matches(Some(re)), 2) => {
+                args.truncate(1);
+                Node::Match(Box::new(args.pop().expect("a subject")), re)
+            }
+            (f @ (Func::ToInt | Func::ToUint), 1) => match args.pop().expect("one argument") {
+                Node::Call1(Func::Size, x) => Node::Size(x, matches!(f, Func::ToUint)),
+                x => Node::Call1(f, Box::new(x)),
+            },
+            (f, 1) => Node::Call1(f, Box::new(args.pop().expect("one argument"))),
+            (f, _) => Node::Call(f, args.into()),
+        };
+        Ok(self.fold(node, ty))
     }
 
     fn expect(&self, name: &str, got: &[Ty], want: &[Ty]) -> Result<()> {
@@ -631,6 +667,7 @@ impl Compiler<'_> {
         }
         let var = self.next;
         self.next += 1;
+        self.used = self.used.max(self.next);
         self.locals.push((c.iter_var.clone(), var_ty.clone(), var));
         let result = self.comprehension_body(&shape);
         self.locals.pop();
@@ -677,6 +714,32 @@ impl Compiler<'_> {
     }
 }
 
+/// A binary operation; a comparison against a constant is fused.
+fn binary(o: Op, a: Node, b: Node) -> Node {
+    if !matches!(o, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge) {
+        return Node::Op(o, Box::new([a, b]));
+    }
+    match (a, b) {
+        (a @ Node::Const(_), b @ Node::Const(_)) => Node::Op(o, Box::new([a, b])),
+        (Node::This, Node::Const(c)) => Node::CompareThis(o, Box::new(c)),
+        (Node::Const(c), Node::This) => Node::CompareThis(flip(o), Box::new(c)),
+        (a, Node::Const(c)) => Node::Compare(o, Box::new((a, c))),
+        (Node::Const(c), b) => Node::Compare(flip(o), Box::new((b, c))),
+        (a, b) => Node::Op(o, Box::new([a, b])),
+    }
+}
+
+/// The comparison with its operands swapped.
+const fn flip(o: Op) -> Op {
+    match o {
+        Op::Lt => Op::Gt,
+        Op::Le => Op::Ge,
+        Op::Gt => Op::Lt,
+        Op::Ge => Op::Le,
+        o => o,
+    }
+}
+
 fn logic(and: bool, a: Node, b: Node) -> Node {
     let absorbing = !and;
     match (a, b) {
@@ -695,7 +758,7 @@ fn closed(n: &Node, bound: u16) -> bool {
         Node::Const(_) => true,
         Node::This | Node::Now => false,
         Node::Local(s) => bound & (1 << s) != 0,
-        Node::Field(x, _)
+        Node::Field(x, ..)
         | Node::Has(x, _)
         | Node::Get(x, _)
         | Node::HasName(x, _)
@@ -705,6 +768,10 @@ fn closed(n: &Node, bound: u16) -> bool {
         Node::Cond(xs) => xs.iter().all(|x| closed(x, bound)),
         Node::List(xs) | Node::Call(_, xs) => xs.iter().all(|x| closed(x, bound)),
         Node::Map(es) => es.iter().all(|(k, v)| closed(k, bound) && closed(v, bound)),
+        Node::CompareThis(..) => false,
+        Node::Compare(_, x) => closed(&x.0, bound),
+        Node::Choose(x) => closed(&x.0, bound),
+        Node::Call1(_, x) | Node::Match(x, _) | Node::Size(x, _) => closed(x, bound),
         Node::Fold(f) => {
             let inner = bound | (1 << f.var);
             closed(&f.range, bound)

@@ -33,9 +33,13 @@ mod plan;
 mod walk;
 
 use std::{
+    cell::Cell,
     collections::HashMap,
     hash::{BuildHasherDefault, Hasher},
-    sync::{Arc, LazyLock, RwLock},
+    sync::{
+        LazyLock, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use buffa_descriptor::{MessageDescriptor, reflect::ReflectMessage};
@@ -55,9 +59,27 @@ use crate::{
 /// Plans are cached per message type for the validator's lifetime, so keep
 /// one validator (or use [`validate`], which shares one) rather than making
 /// one per call. A validator is `Send + Sync`.
-#[derive(Default)]
 pub struct Validator {
-    plans: RwLock<HashMap<usize, Arc<Plans>, BuildHasherDefault<AddressHasher>>>,
+    /// Unique for the process's lifetime: see [`LAST`].
+    id: u64,
+    /// Boxed so a plan's address is stable; plans are never removed.
+    plans: RwLock<HashMap<usize, Box<Plans>, BuildHasherDefault<AddressHasher>>>,
+}
+
+thread_local! {
+    /// The plans this thread last used: validator id, descriptor address, plans.
+    /// Validating the same type again, the common case, then takes no lock.
+    static LAST: Cell<(u64, usize, *const Plans)> = const { Cell::new((u64::MAX, 0, std::ptr::null())) };
+}
+
+impl Default for Validator {
+    fn default() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            plans: RwLock::default(),
+        }
+    }
 }
 
 impl Validator {
@@ -75,7 +97,7 @@ impl Validator {
     /// `runtime_error` when a rule cannot be evaluated.
     pub fn validate(&self, message: &dyn ReflectMessage) -> Result<(), ValidationError> {
         let plans = self.plans(message);
-        let mut walker = Walker::new(&plans);
+        let mut walker = Walker::new(plans);
         match walker.root(message) {
             Ok(()) if walker.violations.is_empty() => Ok(()),
             Ok(()) => Err(ValidationError {
@@ -93,29 +115,37 @@ impl Validator {
         }
     }
 
-    fn plans(&self, message: &dyn ReflectMessage) -> Arc<Plans> {
+    fn plans(&self, message: &dyn ReflectMessage) -> &Plans {
         let md = message.message_descriptor();
         let key = std::ptr::from_ref::<MessageDescriptor>(md) as usize;
-        if let Some(plans) = self
+        let (id, last_key, last) = LAST.get();
+        if id == self.id && last_key == key {
+            // SAFETY: `last` points into a box this validator owns: ids are
+            // never reused, plans are never removed, and `self` outlives the
+            // returned borrow.
+            return unsafe { &*last };
+        }
+        let found = self
             .plans
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
-        {
-            return Arc::clone(plans);
-        }
-        let pool = message.pool();
-        let idx = pool
-            .message_index(md.full_name())
-            .expect("a message's descriptor is in its own pool");
-        let plans = Arc::new(Builder::new(pool).build(idx));
-        Arc::clone(
-            self.plans
+            .map(|p| std::ptr::from_ref::<Plans>(p));
+        let plans = found.unwrap_or_else(|| {
+            let pool = message.pool();
+            let idx = pool
+                .message_index(md.full_name())
+                .expect("a message's descriptor is in its own pool");
+            let built = Box::new(Builder::new(pool).build(idx));
+            let mut map = self
+                .plans
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(key)
-                .or_insert(plans),
-        )
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::ptr::from_ref::<Plans>(map.entry(key).or_insert(built))
+        });
+        LAST.set((self.id, key, plans));
+        // SAFETY: as above.
+        unsafe { &*plans }
     }
 }
 

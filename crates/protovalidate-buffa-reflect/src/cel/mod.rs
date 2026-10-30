@@ -18,6 +18,9 @@ mod eval;
 mod fallback;
 mod format;
 mod functions;
+mod pred;
+#[cfg(test)]
+mod tests;
 mod types;
 pub mod value;
 
@@ -96,7 +99,10 @@ pub enum Outcome<'a> {
 pub struct Program(Kind);
 
 enum Kind {
-    Native(compile::Node),
+    /// A test of `this` alone, as a native check.
+    Check(pred::Check),
+    /// The tree, and how many comprehension variables it binds.
+    Native(compile::Node, usize),
     Fallback(fallback::Program),
 }
 
@@ -104,11 +110,13 @@ impl Program {
     /// Compiles `source`. `Ok(None)` is an expression that can never fail
     /// once its constants are folded in, and needs no evaluation.
     pub fn compile(source: &str, bindings: &Bindings<'_>) -> Result<Option<Self>, CompileError> {
-        let ast = cel::parser::Parser::new()
+        let ast = fallback::parser()
             .parse(source)
             .map_err(|e| CompileError(format!("failed to parse `{source}`: {e}")))?;
         match compile::compile(&ast, bindings) {
-            Ok(node) => Ok(node.map(|n| Self(Kind::Native(n)))),
+            Ok(node) => Ok(node.map(|(n, locals)| {
+                Self(pred::Check::from_node(&n).map_or(Kind::Native(n, locals), Kind::Check))
+            })),
             Err(compile::Refusal::Error(e)) => Err(CompileError(format!("`{source}`: {e}"))),
             Err(compile::Refusal::Unsupported) => {
                 fallback::Program::compile(source, bindings).map(|p| Some(Self(Kind::Fallback(p))))
@@ -118,7 +126,14 @@ impl Program {
 
     pub fn eval<'a>(&'a self, this: &Value<'a>, clock: &Clock) -> Result<Outcome<'a>, Error> {
         let result = match &self.0 {
-            Kind::Native(node) => eval::run(node, this, clock)?,
+            Kind::Check(check) => {
+                return Ok(if check.pred.eval(this)? == check.fails_when {
+                    Outcome::Fail(check.message.as_deref().map(Str::Ref))
+                } else {
+                    Outcome::Pass
+                });
+            }
+            Kind::Native(node, locals) => eval::run(node, *locals, this, clock)?,
             Kind::Fallback(program) => return program.eval(this, clock),
         };
         outcome(result)

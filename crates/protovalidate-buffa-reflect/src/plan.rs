@@ -64,6 +64,7 @@ pub struct MessageOneof {
 
 pub struct FieldPlan {
     pub index: usize,
+    pub read: value::Read,
     pub elem: Elem,
     pub required: bool,
     /// Unset fields are skipped: the field tracks presence, or the rules
@@ -413,6 +414,7 @@ impl<'p> Builder<'p> {
         };
         Some(FieldPlan {
             index,
+            read: value::Read::of(fd, self.pool),
             elem: elem(fd, None),
             required: rules.is_some_and(|r| get_bool(r, "required")),
             skip_unset: presence || ignore == IGNORE_IF_ZERO_VALUE,

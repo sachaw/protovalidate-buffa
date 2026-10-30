@@ -40,6 +40,11 @@ pub struct Program {
 
 static ENV: LazyLock<Arc<Env>> = LazyLock::new(|| Arc::new(env()));
 
+/// The interpreter's parser, so both paths accept the same syntax.
+pub fn parser() -> cel::parser::Parser {
+    ENV.parser()
+}
+
 impl Program {
     pub fn compile(source: &str, bindings: &Bindings<'_>) -> Result<Self, CompileError> {
         let program = ENV
@@ -54,6 +59,7 @@ impl Program {
         })
     }
 
+    #[inline(never)]
     pub fn eval<'a>(&'a self, this: &Value<'a>, clock: &Clock) -> Result<Outcome<'a>, Error> {
         let mut vars: Vec<(&str, Box<dyn Val + '_>)> = vec![
             ("this", to_val(this, &self.has)),

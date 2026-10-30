@@ -181,6 +181,40 @@ impl<'a> Msg<'a> {
     /// CEL reads it: unset fields as their defaults, well-known types as
     /// their CEL values.
     pub fn field(&self, index: usize) -> Value<'a> {
+        let fd = &self.descriptor().fields()[index];
+        let read = match fd.kind() {
+            FieldKind::Singular(SingularKind::Message(idx)) => {
+                Read::Message(wkt(self.pool().message(idx)))
+            }
+            _ => Read::Value,
+        };
+        self.read(index, read, None)
+    }
+
+    /// Reads a field whose [`Read`] was worked out when compiling; `present`
+    /// when the caller already asked.
+    pub fn read(&self, index: usize, read: Read, present: Option<bool>) -> Value<'a> {
+        if let (Self::Ref(m), Read::Message(w)) = (self, read) {
+            let fd = &m.message_descriptor().fields()[index];
+            if !present.unwrap_or_else(|| m.has(fd)) {
+                let FieldKind::Singular(SingularKind::Message(idx)) = fd.kind() else {
+                    unreachable!("read as a message field");
+                };
+                return default_message(m.pool().message(idx), m.pool());
+            }
+            return match m.get(fd) {
+                ValueRef::Message(ReflectCow::Borrowed(r)) => message_as(Msg::Ref(r), w),
+                v => from_field(v, fd),
+            };
+        }
+        if let (Self::Ref(m), Read::Value) = (self, read) {
+            let fd = &m.message_descriptor().fields()[index];
+            return from_field(m.get(fd), fd);
+        }
+        self.field_slow(index)
+    }
+
+    fn field_slow(&self, index: usize) -> Value<'a> {
         match self {
             Self::Ref(m) => {
                 let fd = &m.message_descriptor().fields()[index];
@@ -328,7 +362,32 @@ pub fn wkt(md: &MessageDescriptor) -> Option<Wkt> {
 
 /// A message as CEL sees it: well-known types become their CEL values.
 pub fn message(m: Msg<'_>) -> Value<'_> {
-    match wkt(m.descriptor()) {
+    let w = wkt(m.descriptor());
+    message_as(m, w)
+}
+
+/// What reading a field yields, worked out from its descriptor once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Read {
+    Value,
+    /// A singular message field, and which well-known type it is.
+    Message(Option<Wkt>),
+}
+
+impl Read {
+    pub fn of(fd: &FieldDescriptor, pool: &DescriptorPool) -> Self {
+        match fd.kind() {
+            FieldKind::Singular(SingularKind::Message(idx)) => {
+                Self::Message(wkt(pool.message(idx)))
+            }
+            _ => Self::Value,
+        }
+    }
+}
+
+/// [`message`], for a message whose well-known type is already known.
+pub fn message_as(m: Msg<'_>, w: Option<Wkt>) -> Value<'_> {
+    match w {
         Some(Wkt::Timestamp) => match seconds_nanos(&m) {
             Some((s, n)) => u32::try_from(n)
                 .ok()
