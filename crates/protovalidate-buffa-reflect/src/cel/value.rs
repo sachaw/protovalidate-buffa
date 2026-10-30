@@ -663,13 +663,13 @@ impl<'a> Field<'a> {
         });
         if !repeats {
             let _ = wire::entries(&self.src, number, key, kind, self.pool, &mut |e| {
-                f(key_of(&e), value_of(&e))
+                f(key_of(e), value_of(e))
             });
             return;
         }
         let mut all = Vec::new();
         let _ = wire::entries(&self.src, number, key, kind, self.pool, &mut |e| {
-            all.push((key_of(&e), value_of(&e)));
+            all.push((key_of(e), value_of(e)));
             true
         });
         // Stable, so the last of equal keys sorts last.

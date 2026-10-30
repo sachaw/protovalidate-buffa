@@ -27,13 +27,13 @@ pub enum Abort {
 struct Path<'p, 'a> {
     parent: Option<&'p Self>,
     elem: &'a Elem,
-    sub: Sub<'a>,
+    sub: Sub<'p, 'a>,
 }
 
-enum Sub<'a> {
+enum Sub<'k, 'a> {
     None,
     Index(usize),
-    Key(Value<'a>),
+    Key(&'k Value<'a>),
 }
 
 /// The rule a violation reports.
@@ -352,10 +352,10 @@ impl<'a> Walker<'a> {
             let here = Path {
                 parent: path.parent,
                 elem: path.elem,
-                sub: Sub::Key(k),
+                sub: Sub::Key(&k),
             };
             result = self
-                .value(keys, &key_value(&here), &here, true)
+                .value(keys, &k, &here, true)
                 .and_then(|()| self.value(values, &v, &here, false));
             result.is_ok()
         });
@@ -408,13 +408,6 @@ fn failure<'a>(rule: &'a Rule, v: &Value<'a>, clock: &Clock) -> String {
     match rule.program.eval(v, clock) {
         Ok(Outcome::Fail(Some(m))) => m.to_string(),
         _ => rule.message.to_string(),
-    }
-}
-
-fn key_value<'a>(p: &Path<'_, 'a>) -> Value<'a> {
-    match &p.sub {
-        Sub::Key(k) => k.clone(),
-        _ => Value::Null,
     }
 }
 

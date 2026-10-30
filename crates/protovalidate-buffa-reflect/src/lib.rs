@@ -74,7 +74,7 @@ use crate::{
 /// one validator (or use [`validate`], which shares one) rather than making
 /// one per call. A validator is `Send + Sync`.
 pub struct Validator {
-    /// Unique for the process's lifetime: see [`LAST`].
+    /// Unique for the process's lifetime: see [`Cache::last`].
     id: u64,
     /// By descriptor address, which the plans' hold on their pool keeps from
     /// being reused.

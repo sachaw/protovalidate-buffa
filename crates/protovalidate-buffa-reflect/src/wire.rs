@@ -651,7 +651,7 @@ pub fn entries<'a>(
     key: ScalarType,
     value: Kind,
     pool: &DescriptorPool,
-    f: &mut dyn FnMut(Entry<'a>) -> bool,
+    f: &mut dyn FnMut(&Entry<'a>) -> bool,
 ) -> Result<(), Malformed> {
     let key = Kind::Scalar(key);
     let mut stop = false;
@@ -682,7 +682,7 @@ pub fn entries<'a>(
             Ok::<(), Malformed>(())
         })?;
         if !dropped {
-            stop = !f(Entry {
+            stop = !f(&Entry {
                 key: k,
                 value: v,
                 src,

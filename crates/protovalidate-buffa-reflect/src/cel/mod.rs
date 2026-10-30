@@ -2,7 +2,7 @@
 //!
 //! A rule's expression is parsed by `cel`, checked against the message types
 //! it reads (an unknown field or an impossible call is a compilation error,
-//! as in protovalidate's other implementations), and lowered to a [`Node`]
+//! as in protovalidate's other implementations), and lowered to a [`Node`](compile::Node)
 //! tree in which field names are field indices and the rule's own values
 //! (`rules`, `rule`) are folded in as constants. A tree that tests only
 //! `this` and its fields, as standard rules fold to, runs as a native check
