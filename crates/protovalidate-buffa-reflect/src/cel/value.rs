@@ -8,8 +8,8 @@
 use std::{cmp::Ordering, fmt, rc::Rc, sync::Arc};
 
 use buffa_descriptor::{
-    DescriptorPool, FieldDescriptor, MessageDescriptor, MessageIndex, ScalarType,
-    reflect::DynamicMessage,
+    DescriptorPool, FieldDescriptor, FieldKind, MessageDescriptor, MessageIndex, ScalarType,
+    SingularKind, reflect::DynamicMessage,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 
@@ -578,10 +578,25 @@ pub fn message_as(m: Msg<'_>, w: Option<Wkt>) -> Value<'_> {
                 .map_or(Value::Message(m), Value::Duration),
             None => Value::Message(m),
         },
-        Some(Wkt::Wrapper | Wkt::Struct | Wkt::ListValue) => m.field(0),
+        Some(Wkt::Wrapper) => wrapped(&m),
+        Some(Wkt::Struct | Wkt::ListValue) => m.field(0),
         Some(Wkt::Value) => json_value(&m),
         _ => Value::Message(m),
     }
+}
+
+/// A wrapper's `value = 1`.
+fn wrapped<'a>(m: &Msg<'a>) -> Value<'a> {
+    let Some(FieldKind::Singular(SingularKind::Scalar(s))) =
+        m.descriptor().fields().first().map(FieldDescriptor::kind)
+    else {
+        return m.field(0);
+    };
+    let found =
+        wire::singular(&m.src, &Shape::entry(1, Kind::Scalar(s)), m.pool).unwrap_or_default();
+    found
+        .last(&m.src)
+        .map_or_else(|| default_scalar(s), |raw| scalar(raw, s))
 }
 
 /// A `Timestamp`'s or `Duration`'s fields: `int64 seconds = 1`, `int32 nanos

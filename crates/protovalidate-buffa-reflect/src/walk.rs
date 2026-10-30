@@ -10,7 +10,7 @@ use crate::{
         Clock, Outcome,
         value::{self, Gathered, List, Map, Msg, Prim, Value},
     },
-    plan::{Check, Elem, MessagePlan, Plans, Rule, ValuePlan},
+    plan::{Check, Elem, MessagePlan, Plans, Route, Rule, ValuePlan},
     wire::{self, Card, Found, Kind, Malformed, Raw},
 };
 
@@ -90,20 +90,25 @@ impl<'a> Walker<'a> {
         if !plan.slots.is_empty() {
             msg.src
                 .visit_at(&mut |n, raw, at| {
-                    if let Some(s) = plan.dispatch.get(n) {
+                    let Some(route) = plan.dispatch.route(n) else {
+                        return Ok(());
+                    };
+                    if route.wires & raw.wire() == 0 {
+                        return Ok(());
+                    }
+                    let s = usize::from(route.slot);
+                    if route.flags != 0 {
                         let slot = &plan.slots[s];
-                        let shape = &slot.read.shape;
-                        if shape.accepts(raw, pool)
-                            && !(shape.card == Card::List
-                                && shape.kind.packable()
-                                && matches!(raw, Raw::Len([])))
+                        if route.flags & Route::CLOSED != 0 && !slot.read.shape.accepts(raw, pool)
+                            || route.flags & Route::PACKED != 0 && matches!(raw, Raw::Len([]))
                         {
-                            for &other in &slot.siblings {
-                                found[other].clear();
-                            }
-                            found[s].take(raw, at, n);
+                            return Ok(());
+                        }
+                        for &other in &slot.siblings {
+                            found[other].clear();
                         }
                     }
+                    found[s].take(raw, at, n);
                     Ok::<(), Malformed>(())
                 })
                 .map_err(|_| Box::new(Abort::Malformed))?;

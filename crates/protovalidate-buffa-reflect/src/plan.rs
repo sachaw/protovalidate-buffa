@@ -27,7 +27,7 @@ use crate::{
         Bindings, Program, Ty,
         value::{self, Const, ConstMsg, Msg, Read, Wkt},
     },
-    wire::Src,
+    wire::{Card, Kind, Src},
 };
 
 /// A path element, kept in a plan and written out only for a violation.
@@ -1035,53 +1035,95 @@ fn layout(plan: &mut MessagePlan, md: &MessageDescriptor, pool: &DescriptorPool)
             }
         })
         .collect();
-    plan.dispatch = Dispatch::new(order.iter().map(|&f| md.fields()[f].number()));
+    plan.dispatch = Dispatch::new(
+        order
+            .iter()
+            .zip(&plan.slots)
+            .enumerate()
+            .map(|(s, (&f, slot))| (md.fields()[f].number(), Route::of(s, slot))),
+    );
 }
 
-/// Field numbers to slots.
+/// Where a field number goes in a walk: its slot, the wire types it takes
+/// (a bit per type), and what else taking one needs.
+#[derive(Clone, Copy)]
+pub struct Route {
+    pub slot: u16,
+    pub wires: u8,
+    pub flags: u8,
+}
+
+impl Route {
+    /// A closed enum's value, which must be one the enum declares.
+    pub const CLOSED: u8 = 1;
+    /// A oneof member, which clears the others.
+    pub const SIBLINGS: u8 = 2;
+    /// A packed list, whose empty runs hold nothing.
+    pub const PACKED: u8 = 4;
+
+    fn of(slot: usize, s: &Slot) -> Self {
+        let shape = &s.read.shape;
+        let mut flags = 0;
+        if matches!(shape.kind, Kind::Enum(Some(_))) && !matches!(shape.card, Card::Map(_)) {
+            flags |= Self::CLOSED;
+        }
+        if !s.siblings.is_empty() {
+            flags |= Self::SIBLINGS;
+        }
+        if shape.card == Card::List && shape.kind.packable() {
+            flags |= Self::PACKED;
+        }
+        Self {
+            slot: u16::try_from(slot).unwrap_or(u16::MAX),
+            wires: shape.wires(),
+            flags,
+        }
+    }
+}
+
+/// Field numbers to routes.
 #[derive(Default)]
 pub enum Dispatch {
-    /// Indexed by field number: the slot plus one, or zero.
-    Dense(Box<[u16]>),
+    /// Indexed by field number.
+    Dense(Box<[Option<Route>]>),
     /// Sorted by field number.
-    Sparse(Box<[(u32, u16)]>),
+    Sparse(Box<[(u32, Route)]>),
     #[default]
     None,
 }
 
 impl Dispatch {
-    fn new(numbers: impl Iterator<Item = u32>) -> Self {
-        let mut pairs: Vec<(u32, u16)> = numbers
-            .enumerate()
-            .map(|(s, n)| (n, u16::try_from(s).unwrap_or(u16::MAX)))
-            .collect();
+    fn new(routes: impl Iterator<Item = (u32, Route)>) -> Self {
+        let mut pairs: Vec<(u32, Route)> = routes.collect();
         let Some(max) = pairs.iter().map(|p| p.0).max() else {
             return Self::None;
         };
         if max as usize <= 64 + 4 * pairs.len() {
-            let mut dense = vec![0u16; max as usize + 1];
-            for (n, s) in pairs {
-                dense[n as usize] = s + 1;
+            let mut dense = vec![None; max as usize + 1];
+            for (n, r) in pairs {
+                dense[n as usize] = Some(r);
             }
             Self::Dense(dense.into())
         } else {
-            pairs.sort_unstable();
+            pairs.sort_unstable_by_key(|p| p.0);
             Self::Sparse(pairs.into())
         }
     }
 
     #[inline]
-    pub fn get(&self, number: u32) -> Option<usize> {
+    pub fn route(&self, number: u32) -> Option<Route> {
         match self {
-            Self::Dense(d) => match d.get(number as usize) {
-                Some(&s) if s > 0 => Some(usize::from(s - 1)),
-                _ => None,
-            },
+            Self::Dense(d) => d.get(number as usize).copied().flatten(),
             Self::Sparse(p) => p
                 .binary_search_by_key(&number, |&(n, _)| n)
                 .ok()
-                .map(|i| usize::from(p[i].1)),
+                .map(|i| p[i].1),
             Self::None => None,
         }
+    }
+
+    #[inline]
+    pub fn get(&self, number: u32) -> Option<usize> {
+        self.route(number).map(|r| usize::from(r.slot))
     }
 }

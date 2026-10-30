@@ -113,6 +113,20 @@ fn group<'a>(buf: &mut &'a [u8], number: u32, depth: u32) -> Result<&'a [u8], Ma
     }
 }
 
+impl Raw<'_> {
+    /// The wire type, as a bit of [`Shape::wires`].
+    #[inline]
+    pub const fn wire(&self) -> u8 {
+        1 << match self {
+            Self::Varint(_) => 0,
+            Self::I64(_) => 1,
+            Self::Len(_) => 2,
+            Self::Group(_) => 3,
+            Self::I32(_) => 5,
+        }
+    }
+}
+
 /// The encoding of one message: a slice, or the occurrences of a message
 /// field, which merge as their concatenation does.
 #[derive(Clone)]
@@ -362,6 +376,22 @@ impl Shape {
                 matches!(raw, Raw::Len(_)) && self.kind.packable() || self.kind.accepts(raw, pool)
             }
             Card::Map(_) => matches!(raw, Raw::Len(_)),
+        }
+    }
+
+    /// The wire types an occurrence of the field may have, a bit each as
+    /// [`Raw::wire`] gives them.
+    pub const fn wires(&self) -> u8 {
+        let element = match self.kind {
+            Kind::Message(_) => 1 << 2 | 1 << 3,
+            Kind::Enum(_) => 1,
+            Kind::Scalar(s) => 1 << wire(s),
+        };
+        match self.card {
+            Card::Singular => element,
+            Card::List if self.kind.packable() => element | 1 << 2,
+            Card::List => element,
+            Card::Map(_) => 1 << 2,
         }
     }
 

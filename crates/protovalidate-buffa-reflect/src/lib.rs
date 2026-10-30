@@ -178,21 +178,6 @@ impl Validator {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn probe_cache(&self, md: &MessageDescriptor, pool: &Arc<DescriptorPool>) -> usize {
-        self.with_cache(md, pool, |p, _| p.messages.len())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn probe_run(
-        &self,
-        md: &MessageDescriptor,
-        pool: &Arc<DescriptorPool>,
-        b: &[u8],
-    ) -> bool {
-        self.with_cache(md, pool, |p, s| run(p, b, s.spare).is_ok())
-    }
-
     /// Calls `f` with the plans for `md`, and the thread's buffers unless a
     /// validation on this thread is already using them.
     fn with_cache<R>(
