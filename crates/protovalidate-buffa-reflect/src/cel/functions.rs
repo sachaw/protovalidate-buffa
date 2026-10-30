@@ -12,7 +12,7 @@ use super::{
     compile::{Func, Op, Time},
     eval::select,
     format,
-    value::{Bin, List, Str, Value, equals},
+    value::{Bin, List, Str, Value},
 };
 
 /// The bounds of CEL's timestamps: years 1 through 9999.
@@ -436,43 +436,83 @@ fn host_and_port(s: &str, port_required: bool) -> bool {
 }
 
 fn unique(v: &Value<'_>) -> Result<bool, Error> {
-    const SMALL: usize = 16;
     let Value::List(list) = v else {
         return Err(overload("unique", std::slice::from_ref(v)));
     };
-    // Small lists compare pairwise rather than build a set.
-    let mut small = [const { Value::Null }; SMALL];
-    let mut n = 0;
+    // Items are hashed into a small filter; only a possible repeat builds a
+    // set.
+    let mut filter = [0u64; 4];
+    let mut repeats = false;
+    let mut error = None;
     list.for_each(&mut |item| {
-        if n < SMALL {
-            small[n] = item;
-        }
-        n += 1;
-        n <= SMALL
-    });
-    if n <= SMALL {
-        let items = &small[..n];
-        return Ok(items
-            .iter()
-            .enumerate()
-            .all(|(i, a)| !items[i + 1..].iter().any(|b| equals(a, b))));
-    }
-    let mut seen = HashSet::with_capacity(n);
-    for item in list.items() {
-        let key = match item {
-            Value::Bool(b) => Key::Bool(b),
-            Value::Int(i) => Key::Int(i128::from(i)),
-            Value::Uint(u) => Key::Int(i128::from(u)),
-            Value::Double(d) => Key::Double(d.to_bits()),
-            Value::String(s) => Key::Bytes(s.as_bytes().to_vec()),
-            Value::Bytes(b) => Key::Bytes(b.to_vec()),
-            other => return Err(overload("unique", &[Value::List(list.clone()), other])),
+        let h = match hash(&item) {
+            Ok(Some(h)) => h.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            Ok(None) => return true,
+            Err(e) => {
+                error = Some(e);
+                return false;
+            }
         };
-        if !seen.insert(key) {
-            return Ok(false);
-        }
+        let (word, bit) = ((h >> 62) as usize, 1 << ((h >> 56) & 63));
+        repeats = filter[word] & bit != 0;
+        filter[word] |= bit;
+        !repeats
+    });
+    if let Some(e) = error {
+        return Err(e);
     }
-    Ok(true)
+    if !repeats {
+        return Ok(true);
+    }
+    let mut seen = HashSet::new();
+    let mut unique = true;
+    list.for_each(&mut |item| {
+        if let Ok(Some(key)) = key(&item) {
+            unique = seen.insert(key);
+        }
+        unique
+    });
+    Ok(unique)
+}
+
+/// A hash of an item that agrees with [`key`].
+fn hash(item: &Value<'_>) -> Result<Option<u64>, Error> {
+    let bytes = |b: &[u8]| {
+        b.iter().fold(0xcbf2_9ce4_8422_2325, |h, &c| {
+            (h ^ u64::from(c)).wrapping_mul(0x100_0000_01b3)
+        })
+    };
+    Ok(match item {
+        Value::String(s) => Some(bytes(s.as_bytes())),
+        Value::Bytes(b) => Some(bytes(b)),
+        other => key(other)?.map(|k| match k {
+            Key::Bool(b) => u64::from(b),
+            #[expect(clippy::cast_possible_truncation, reason = "a hash")]
+            Key::Int(i) => (i as u64) ^ ((i >> 64) as u64),
+            Key::Double(d) => d,
+            Key::Bytes(b) => bytes(&b),
+        }),
+    })
+}
+
+/// An item as `unique()` compares it: numbers by value; `None` for NaN,
+/// which equals nothing.
+fn key(item: &Value<'_>) -> Result<Option<Key>, Error> {
+    Ok(Some(match item {
+        Value::Bool(b) => Key::Bool(*b),
+        Value::Int(i) => Key::Int(i128::from(*i)),
+        Value::Uint(u) => Key::Int(i128::from(*u)),
+        Value::Double(d) if d.is_nan() => return Ok(None),
+        Value::Double(d) if d.fract() == 0.0 && d.abs() < 1.8e19 =>
+        {
+            #[expect(clippy::cast_possible_truncation, reason = "integral and in range")]
+            Key::Int(*d as i128)
+        }
+        Value::Double(d) => Key::Double(d.to_bits()),
+        Value::String(s) => Key::Bytes(s.as_bytes().to_vec()),
+        Value::Bytes(b) => Key::Bytes(b.to_vec()),
+        other => return Err(overload("unique", &[other.clone()])),
+    }))
 }
 
 #[derive(Hash, PartialEq, Eq)]

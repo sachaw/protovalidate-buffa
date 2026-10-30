@@ -61,7 +61,7 @@ use crate::{
     cel::value::Msg,
     plan::{Builder, Plans},
     walk::{Abort, Walker},
-    wire::{Found, Malformed, Src},
+    wire::{Found, Src},
 };
 
 /// Validates messages against the rules in their descriptors.
@@ -138,7 +138,7 @@ impl Validator {
             encode(scratch.buffer);
             run(plans, scratch.buffer, scratch.spare)
         })
-        .unwrap_or_else(|Malformed| Err(malformed(md)))
+        .map_err(|f| f.into_error(md))
     }
 
     /// Validates an encoded message of type `message` in `pool`, without
@@ -161,7 +161,7 @@ impl Validator {
     ) -> Result<(), ValidationError> {
         let md = pool.message(message);
         self.with_cache(md, pool, |plans, scratch| run(plans, bytes, scratch.spare))
-            .unwrap_or_else(|Malformed| Err(malformed(md)))
+            .map_err(|f| f.into_error(md))
     }
 
     /// [`validate_encoded`](Self::validate_encoded), telling bytes that do
@@ -172,7 +172,7 @@ impl Validator {
         pool: &Arc<DescriptorPool>,
         message: MessageIndex,
         bytes: &[u8],
-    ) -> Result<Result<(), ValidationError>, Malformed> {
+    ) -> Result<(), Box<Failure>> {
         self.with_cache(pool.message(message), pool, |plans, scratch| {
             run(plans, bytes, scratch.spare)
         })
@@ -251,38 +251,47 @@ struct Scratch<'c> {
     spare: &'c mut Vec<Vec<Found>>,
 }
 
-fn run(
-    plans: &Plans,
-    bytes: &[u8],
-    spare: &mut Vec<Vec<Found>>,
-) -> Result<Result<(), ValidationError>, Malformed> {
+/// Why a validation did not pass, boxed so that passing, the common case,
+/// returns in a register.
+enum Failure {
+    Invalid(ValidationError),
+    Malformed,
+}
+
+impl Failure {
+    fn into_error(self: Box<Self>, md: &MessageDescriptor) -> ValidationError {
+        match *self {
+            Self::Invalid(e) => e,
+            Self::Malformed => ValidationError {
+                runtime_error: Some(format!("malformed encoding of {}", md.full_name())),
+                ..ValidationError::default()
+            },
+        }
+    }
+}
+
+fn run(plans: &Plans, bytes: &[u8], spare: &mut Vec<Vec<Found>>) -> Result<(), Box<Failure>> {
     let mut walker = Walker::new(plans, std::mem::take(spare));
     let root = Msg::new(Src::Bytes(bytes), plans.root, &plans.pool);
     let result = walker.root(&root);
     *spare = std::mem::take(&mut walker.spare);
-    Ok(match result {
-        Ok(()) if walker.violations.is_empty() => Ok(()),
-        Ok(()) => Err(ValidationError {
+    let error = match result.map_err(|abort| *abort) {
+        Ok(()) if walker.violations.is_empty() => return Ok(()),
+        Ok(()) => ValidationError {
             violations: walker.violations,
             ..ValidationError::default()
-        }),
-        Err(Abort::Compile(e)) => Err(ValidationError {
+        },
+        Err(Abort::Compile(e)) => ValidationError {
             compile_error: Some(e),
             ..ValidationError::default()
-        }),
-        Err(Abort::Runtime(e)) => Err(ValidationError {
+        },
+        Err(Abort::Runtime(e)) => ValidationError {
             runtime_error: Some(e),
             ..ValidationError::default()
-        }),
-        Err(Abort::Malformed) => return Err(Malformed),
-    })
-}
-
-fn malformed(md: &MessageDescriptor) -> ValidationError {
-    ValidationError {
-        runtime_error: Some(format!("malformed encoding of {}", md.full_name())),
-        ..ValidationError::default()
-    }
+        },
+        Err(Abort::Malformed) => return Err(Box::new(Failure::Malformed)),
+    };
+    Err(Box::new(Failure::Invalid(error)))
 }
 
 /// Validates `message` with a validator shared by the process.

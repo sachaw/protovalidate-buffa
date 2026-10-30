@@ -481,6 +481,19 @@ pub const fn zero(s: ScalarType) -> Prim<'static> {
 }
 
 impl<'a> Prim<'a> {
+    /// A hash of a map key's value.
+    fn hash(self) -> u64 {
+        match self {
+            Self::Int(i) => i.cast_unsigned(),
+            Self::Uint(u) => u,
+            Self::Double(d) => d.to_bits(),
+            Self::Bool(b) => u64::from(b),
+            Self::Str(b) | Self::Bytes(b) => b.iter().fold(0xcbf2_9ce4_8422_2325, |h, &c| {
+                (h ^ u64::from(c)).wrapping_mul(0x100_0000_01b3)
+            }),
+        }
+    }
+
     #[inline]
     pub fn is_zero(self) -> bool {
         match self {
@@ -617,7 +630,6 @@ impl<'a> Field<'a> {
     /// Visits each entry whose key no later entry repeats: the entries a
     /// decoder keeps.
     fn entries(&self, f: &mut dyn FnMut(Value<'a>, Value<'a>) -> bool) {
-        const SMALL: usize = 16;
         let Card::Map(key) = self.card else {
             return;
         };
@@ -628,33 +640,28 @@ impl<'a> Field<'a> {
         };
         let value_of = |e: &wire::Entry<'a>| singular(&e.value, &e.src, &value_read, self.pool);
         let (number, kind) = (self.number, self.kind);
-        // Few entries are checked for repeated keys pairwise, on the stack.
-        let mut small = [const { None }; SMALL];
-        let mut n = 0;
+        // A key a decoder sees twice keeps its last entry. Keys are hashed
+        // into a small filter; only a possible repeat sorts the entries.
+        let mut filter = [0u64; 4];
+        let mut repeats = false;
         let _ = wire::entries(&self.src, number, key, kind, self.pool, &mut |e| {
-            if n < SMALL {
-                small[n] = Some((key_of(&e), e));
-            }
-            n += 1;
-            n <= SMALL
+            let h = e
+                .key
+                .map_or(zero(key), |k| prim(k, key))
+                .hash()
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let (word, bit) = ((h >> 62) as usize, 1 << ((h >> 56) & 63));
+            repeats = filter[word] & bit != 0;
+            filter[word] |= bit;
+            !repeats
         });
-        if n <= SMALL {
-            let small = &small[..n];
-            for (i, (k, e)) in small.iter().flatten().enumerate() {
-                if small[i + 1..]
-                    .iter()
-                    .flatten()
-                    .any(|(later, _)| equals(k, later))
-                {
-                    continue;
-                }
-                if !f(k.clone(), value_of(e)) {
-                    break;
-                }
-            }
+        if !repeats {
+            let _ = wire::entries(&self.src, number, key, kind, self.pool, &mut |e| {
+                f(key_of(&e), value_of(&e))
+            });
             return;
         }
-        let mut all = Vec::with_capacity(n);
+        let mut all = Vec::new();
         let _ = wire::entries(&self.src, number, key, kind, self.pool, &mut |e| {
             all.push((key_of(&e), value_of(&e)));
             true

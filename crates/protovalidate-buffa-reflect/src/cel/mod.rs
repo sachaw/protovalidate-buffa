@@ -130,7 +130,25 @@ impl Program {
         }
     }
 
+    /// Whether `this` passes. A failure's message is [`eval`](Self::eval)'s:
+    /// asking only whether it passes keeps the common case small.
     #[inline]
+    pub fn passes<'a>(&'a self, this: &Value<'a>, clock: &Clock) -> Result<bool, Box<Error>> {
+        match &self.0 {
+            Kind::Check(check) => {
+                let held = match check.typed.as_ref().and_then(|test| test(this)) {
+                    Some(held) => held,
+                    None => check.pred.eval(this).map_err(Box::new)?,
+                };
+                Ok(held != check.fails_when)
+            }
+            _ => self
+                .eval(this, clock)
+                .map(|o| matches!(o, Outcome::Pass))
+                .map_err(Box::new),
+        }
+    }
+
     pub fn eval<'a>(&'a self, this: &Value<'a>, clock: &Clock) -> Result<Outcome<'a>, Error> {
         let result = match &self.0 {
             Kind::Check(check) => {

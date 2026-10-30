@@ -15,7 +15,7 @@ use connectrpc::{
 };
 use futures_util::StreamExt as _;
 
-use crate::Validator;
+use crate::{Failure, Validator};
 
 impl Validator {
     /// Validates a request in a handler, as an `invalid_argument` error
@@ -108,9 +108,13 @@ impl Inner {
             },
             _ => return Ok(()),
         };
-        result
-            .unwrap_or(Ok(()))
-            .map_err(protovalidate_buffa::ValidationError::into_connect_error)
+        match result {
+            Ok(()) => Ok(()),
+            Err(failure) => match *failure {
+                Failure::Invalid(e) => Err(e.into_connect_error()),
+                Failure::Malformed => Ok(()),
+            },
+        }
     }
 }
 

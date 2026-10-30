@@ -10,7 +10,7 @@ use crate::{
         Clock, Outcome,
         value::{self, Gathered, List, Map, Msg, Prim, Value},
     },
-    plan::{Check, Elem, MessagePlan, Plans, ValuePlan},
+    plan::{Check, Elem, MessagePlan, Plans, Rule, ValuePlan},
     wire::{self, Card, Found, Kind, Malformed, Raw},
 };
 
@@ -63,7 +63,7 @@ impl<'a> Walker<'a> {
         }
     }
 
-    pub fn root(&mut self, msg: &Msg<'a>) -> Result<(), Abort> {
+    pub fn root(&mut self, msg: &Msg<'a>) -> Result<(), Box<Abort>> {
         self.message(0, msg, None)
     }
 
@@ -72,14 +72,14 @@ impl<'a> Walker<'a> {
         plan: usize,
         msg: &Msg<'a>,
         path: Option<&Path<'_, 'a>>,
-    ) -> Result<(), Abort> {
+    ) -> Result<(), Box<Abort>> {
         let plans = self.plans;
         let plan: &'a MessagePlan = &plans.messages[plan];
         if let Some(e) = &plan.error {
-            return Err(Abort::Compile(e.clone()));
+            return Err(Box::new(Abort::Compile(e.clone())));
         }
         if self.depth >= wire::DEPTH {
-            return Err(Abort::Malformed);
+            return Err(Box::new(Abort::Malformed));
         }
         let pool = msg.pool;
 
@@ -106,7 +106,7 @@ impl<'a> Walker<'a> {
                     }
                     Ok::<(), Malformed>(())
                 })
-                .map_err(|_| Abort::Malformed)?;
+                .map_err(|_| Box::new(Abort::Malformed))?;
         }
         let result = self.fields(plan, msg, &found, path);
         self.spare.push(found);
@@ -119,7 +119,7 @@ impl<'a> Walker<'a> {
         msg: &Msg<'a>,
         found: &[Found],
         path: Option<&Path<'_, 'a>>,
-    ) -> Result<(), Abort> {
+    ) -> Result<(), Box<Abort>> {
         let pool = msg.pool;
         let present = |s: usize| value::present(&found[s], &plan.slots[s].read, &msg.src, pool);
 
@@ -133,10 +133,10 @@ impl<'a> Walker<'a> {
                 ..msg.clone()
             });
             for rule in &plan.rules {
-                match rule.program.eval(&this, &self.clock) {
-                    Ok(Outcome::Pass) => {}
-                    Ok(Outcome::Fail(m)) => {
-                        let message = m.map_or_else(|| rule.message.to_string(), |m| m.to_string());
+                match rule.program.passes(&this, &self.clock) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let message = failure(rule, &this, &self.clock);
                         self.report(
                             path,
                             None,
@@ -146,7 +146,7 @@ impl<'a> Walker<'a> {
                             false,
                         );
                     }
-                    Err(e) => return Err(Abort::Runtime(format!("{}: {e}", rule.id))),
+                    Err(e) => return Err(Box::new(Abort::Runtime(format!("{}: {e}", rule.id)))),
                 }
             }
         }
@@ -183,7 +183,7 @@ impl<'a> Walker<'a> {
         self.depth += 1;
         for field in &plan.fields {
             if let Some(e) = &field.error {
-                return Err(Abort::Compile(e.clone()));
+                return Err(Box::new(Abort::Compile(e.clone())));
             }
             let present = present(field.slot);
             let here = Path {
@@ -234,16 +234,16 @@ impl<'a> Walker<'a> {
         v: &Value<'a>,
         path: &Path<'_, 'a>,
         for_key: bool,
-    ) -> Result<(), Abort> {
+    ) -> Result<(), Box<Abort>> {
         if plan.ignore_zero && is_zero(v) {
             return Ok(());
         }
         for check in &plan.checks {
             match check {
-                Check::Rule(rule) => match rule.program.eval(v, &self.clock) {
-                    Ok(Outcome::Pass) => {}
-                    Ok(Outcome::Fail(m)) => {
-                        let message = m.map_or_else(|| rule.message.to_string(), |m| m.to_string());
+                Check::Rule(rule) => match rule.program.passes(v, &self.clock) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let message = failure(rule, v, &self.clock);
                         self.report(
                             Some(path),
                             None,
@@ -253,7 +253,7 @@ impl<'a> Walker<'a> {
                             for_key,
                         );
                     }
-                    Err(e) => return Err(Abort::Runtime(format!("{}: {e}", rule.id))),
+                    Err(e) => return Err(Box::new(Abort::Runtime(format!("{}: {e}", rule.id)))),
                 },
                 Check::DefinedEnum { values, path: rule } => {
                     if let Value::Int(n) = v
@@ -315,7 +315,7 @@ impl<'a> Walker<'a> {
         plan: &'a ValuePlan,
         list: &List<'a>,
         path: &Path<'_, 'a>,
-    ) -> Result<(), Abort> {
+    ) -> Result<(), Box<Abort>> {
         let mut result = Ok(());
         let mut i = 0;
         list.for_each(&mut |item| {
@@ -337,7 +337,7 @@ impl<'a> Walker<'a> {
         values: &'a ValuePlan,
         map: &Map<'a>,
         path: &Path<'_, 'a>,
-    ) -> Result<(), Abort> {
+    ) -> Result<(), Box<Abort>> {
         let mut result = Ok(());
         map.for_each(&mut |k, v| {
             let here = Path {
@@ -391,6 +391,14 @@ impl<'a> Walker<'a> {
             message: Cow::Owned(message),
             for_key,
         });
+    }
+}
+
+/// A failed rule's message: the one its expression produced, or its own.
+fn failure<'a>(rule: &'a Rule, v: &Value<'a>, clock: &Clock) -> String {
+    match rule.program.eval(v, clock) {
+        Ok(Outcome::Fail(Some(m))) => m.to_string(),
+        _ => rule.message.to_string(),
     }
 }
 
