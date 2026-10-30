@@ -28,6 +28,10 @@ pub enum Pred {
     In(Operand, Box<[Const]>),
     /// `has(x.f)`, by field index.
     Has(Operand, u32),
+    /// A test of a string `x`, such as `x.isEmail()`.
+    Text(Operand, fn(&str) -> bool),
+    /// A test of a double `x`, such as `x.isNan()`.
+    Number(Operand, fn(f64) -> bool),
     /// A function of `x` and constants.
     Call(Func, Operand, Box<[Const]>),
     Not(Box<Self>),
@@ -148,7 +152,12 @@ impl Pred {
             },
             Node::Has(x, i) => Self::Has(Operand::from_node(x)?, *i),
             Node::Call1(f, s) if pure(f) => {
-                Self::Call(f.clone(), Operand::from_node(s)?, Box::new([]))
+                let x = Operand::from_node(s)?;
+                match (text(f), number(f)) {
+                    (Some(t), _) => Self::Text(x, t),
+                    (_, Some(n)) => Self::Number(x, n),
+                    _ => Self::Call(f.clone(), x, Box::new([])),
+                }
             }
             Node::Call(f, args) if pure(f) => {
                 let (subject, rest) = args.split_first()?;
@@ -205,6 +214,14 @@ impl Pred {
                     other.type_of().name()
                 ))),
             },
+            Self::Text(x, test) => match &*x.get(this)? {
+                Value::String(s) => Ok(test(s)),
+                other => Err(Error::no_overload("string function", &[other.type_of()])),
+            },
+            Self::Number(x, test) => match &*x.get(this)? {
+                Value::Double(d) => Ok(test(*d)),
+                other => Err(Error::no_overload("double function", &[other.type_of()])),
+            },
             Self::Call(f, x, consts) => {
                 let mut args = [const { Value::Null }; 4];
                 args[0] = x.get(this)?.into_owned();
@@ -238,6 +255,29 @@ fn logic(decides: bool, a: &Pred, b: &Pred, this: &Value<'_>) -> Result<bool, Er
         (Err(e), _) | (_, Err(e)) => Err(e),
         (Ok(_), Ok(x)) => Ok(x),
     }
+}
+
+/// The one-argument string functions, as native tests.
+fn text(f: &Func) -> Option<fn(&str) -> bool> {
+    use protovalidate_buffa::rules::string as rules;
+    Some(match f {
+        Func::IsEmail => rules::is_email,
+        Func::IsHostname => rules::is_hostname,
+        Func::IsUri => rules::is_uri,
+        Func::IsUriRef => rules::is_uri_ref,
+        Func::IsIp => rules::is_ip,
+        Func::IsIpPrefix => rules::is_ip_with_prefixlen,
+        _ => return None,
+    })
+}
+
+/// The one-argument double functions, as native tests.
+fn number(f: &Func) -> Option<fn(f64) -> bool> {
+    Some(match f {
+        Func::IsNan => f64::is_nan,
+        Func::IsInf => f64::is_infinite,
+        _ => return None,
+    })
 }
 
 /// Functions of their arguments alone, which a native check may call.
