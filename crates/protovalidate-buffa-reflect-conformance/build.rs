@@ -28,6 +28,10 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("set by cargo"));
     let protos = manifest.join("../protovalidate-buffa-conformance/proto");
     println!("cargo:rerun-if-changed={}", protos.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest.join("proto").display()
+    );
     println!("cargo:rerun-if-env-changed=PROTOC");
 
     let compiler = protoc();
@@ -53,6 +57,19 @@ fn main() {
         &out_dir.join("harness.fds"),
         &["buf/validate/conformance/harness/harness.proto"],
     );
+    let status = std::process::Command::new(&compiler)
+        .arg(format!(
+            "--descriptor_set_out={}",
+            out_dir.join("greeter.fds").display()
+        ))
+        .arg("--include_imports")
+        .arg(format!("-I{}", manifest.join("proto").display()))
+        .arg(format!("-I{}", protos.display()))
+        .arg(format!("-I{}", include.display()))
+        .arg("example/v1/greeter.proto")
+        .status()
+        .expect("run protoc");
+    assert!(status.success(), "protoc failed");
 
     let cases = out_dir.join("cases.fds");
     descriptors(&cases, CASES);

@@ -1,0 +1,21 @@
+// A service for testing request validation.
+
+syntax = "proto3";
+
+package example.v1;
+
+import "buf/validate/validate.proto";
+
+service GreeterService {
+  rpc Greet(GreetRequest) returns (GreetResponse);
+  rpc GreetMany(stream GreetRequest) returns (stream GreetResponse);
+}
+
+message GreetRequest {
+  string name = 1 [(buf.validate.field).string.min_len = 1];
+  repeated string tags = 2 [(buf.validate.field).repeated.unique = true];
+}
+
+message GreetResponse {
+  string greeting = 1;
+}

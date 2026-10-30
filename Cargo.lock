@@ -1130,6 +1130,8 @@ dependencies = [
  "buffa-codegen",
  "buffa-descriptor",
  "buffa-types",
+ "bytes",
+ "connectrpc",
  "protoc-gen-protovalidate-buffa",
  "protovalidate-buffa",
  "protovalidate-buffa-reflect",

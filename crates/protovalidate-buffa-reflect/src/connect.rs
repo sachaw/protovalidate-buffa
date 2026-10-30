@@ -71,6 +71,21 @@ impl ValidateInterceptor {
     }
 }
 
+impl ValidateInterceptor {
+    /// Validates one request message of `procedure` (`/pkg.Service/Method`),
+    /// as the interceptor does: for checking requests in other middleware.
+    ///
+    /// # Errors
+    ///
+    /// The request is invalid, or its rules cannot be evaluated.
+    pub fn check(&self, procedure: &str, payload: &Payload) -> Result<(), ConnectError> {
+        match self.0.inputs.get(procedure) {
+            Some(&input) => self.0.check(input, payload),
+            None => Ok(()),
+        }
+    }
+}
+
 impl Inner {
     fn check(&self, input: MessageIndex, payload: &Payload) -> Result<(), ConnectError> {
         let Ok(bytes) = payload.encoded() else {
@@ -100,8 +115,8 @@ impl Interceptor for ValidateInterceptor {
         req: UnaryRequest,
         next: Next<'_>,
     ) -> Result<UnaryResponse, ConnectError> {
-        if let Some(&input) = req.ctx.path().and_then(|p| self.0.inputs.get(p)) {
-            self.0.check(input, &req.payload)?;
+        if let Some(procedure) = req.ctx.path() {
+            self.check(procedure, &req.payload)?;
         }
         next.run(req).await
     }
