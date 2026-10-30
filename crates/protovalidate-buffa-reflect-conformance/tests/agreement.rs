@@ -235,4 +235,24 @@ fn encodings() {
     agree_encoded::<c::KitchenSinkMessage>(&complex(b""));
     // dur_val (6) written twice: the second, 20s, breaks `lt: 17s`.
     agree_encoded::<c::KitchenSinkMessage>(&complex(b"\x32\x02\x08\x14\x82\x01\x01x"));
+    // val (1) split in two, and its nested (2) split across the halves: the
+    // halves merge, and so do the nested message's.
+    let half = |m: &[u8]| {
+        let mut out = vec![0x0a, u8::try_from(m.len()).expect("short")];
+        out.extend_from_slice(m);
+        out
+    };
+    let nested_a = b"\x0a\x04abcd";
+    let nested_b = b"\x18\x05\x32\x02\x08\x03\x82\x01\x01x";
+    for nested_b in [&nested_b[..], b"\x18\x04\x32\x02\x08\x03\x82\x01\x01x"] {
+        let mut a = b"\x0a\x04abcd\x18\x05\x12".to_vec();
+        a.push(u8::try_from(nested_a.len()).expect("short"));
+        a.extend_from_slice(nested_a);
+        let mut b = b"\x32\x02\x08\x03\x82\x01\x01x\x12".to_vec();
+        b.push(u8::try_from(nested_b.len()).expect("short"));
+        b.extend_from_slice(nested_b);
+        let mut bytes = half(&a);
+        bytes.extend(half(&b));
+        agree_encoded::<c::KitchenSinkMessage>(&bytes);
+    }
 }
