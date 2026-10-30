@@ -1,4 +1,4 @@
-//! [Protovalidate] for buffa messages, through reflection.
+//! [Protovalidate] for buffa messages, from their descriptors.
 //!
 //! A [`Validator`] reads a message type's `buf.validate` rules from its
 //! descriptors the first time it sees the type, compiles them into a plan,
@@ -8,21 +8,23 @@
 //! only known at runtime.
 //!
 //! Validation reads the message's encoding, not a decoded message: one pass
-//! over each message's fields finds what its rules read, straight from the
-//! bytes, as a decoder would read them. A server can validate a request
-//! before decoding it ([`Validator::validate_encoded`]); a message in hand
-//! is encoded first ([`Validator::validate`]), which costs less than reading
-//! it through reflection.
+//! over each message finds the fields its rules read, straight from the
+//! bytes, as a decoder reads them (the last of a repeated scalar, messages
+//! merged, a oneof's last member, unknown fields and closed enums' unknown
+//! values skipped). A server validates a request before decoding it
+//! ([`Validator::validate_encoded`], and the Connect interceptor); a message
+//! in hand is encoded and validated ([`Validator::validate`]).
 //!
 //! Standard rules are the CEL in `validate.proto` itself, compiled with the
 //! rule's values folded in. A rule that folds to a test of the value and its
 //! fields, as every standard rule and most custom rules do, runs as a native
-//! check; other CEL is compiled to a typed tree evaluated over reflection;
+//! check over the scalars it reads; other CEL is compiled to a typed tree;
 //! what that tree does not express runs on the [`cel`] interpreter. A valid
 //! message validates without allocating.
 //!
-//! Generated types need reflection (`generate_reflection(true)` in
-//! `buffa-build`, or the plugin's `reflection` option).
+//! [`Validator::validate`] finds a generated type's descriptor through
+//! reflection (`generate_reflection(true)` in `buffa-build`, or the plugin's
+//! `reflection` option); it reads no field through it.
 //!
 //! ```ignore
 //! let validator = protovalidate_buffa_reflect::Validator::new();

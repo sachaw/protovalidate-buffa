@@ -6,7 +6,7 @@
 //! tree in which field names are field indices and the rule's own values
 //! (`rules`, `rule`) are folded in as constants. A tree that tests only
 //! `this` and its fields, as standard rules fold to, runs as a native check
-//! ([`pred`]). Evaluating either reads the message through reflection and
+//! ([`pred`]). Evaluating either reads the message from its encoding and
 //! allocates only to build a value (a concatenation, a violation message).
 //!
 //! What the tree does not express (optional values, and functions outside

@@ -1,4 +1,4 @@
-//! Walking a message through reflection against its plan.
+//! Walking an encoded message against its plan.
 
 use std::borrow::Cow;
 
