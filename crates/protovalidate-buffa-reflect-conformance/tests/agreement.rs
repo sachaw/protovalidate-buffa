@@ -5,8 +5,12 @@
 
 use std::sync::Arc;
 
-use buffa::Message;
+use buffa::{
+    Message,
+    view::{HasMessageView, OwnedView},
+};
 use buffa_descriptor::reflect::{DynamicMessage, ReflectMessage};
+use bytes::Bytes;
 use protovalidate_buffa::{Validate, ValidationError};
 use protovalidate_buffa_reflect::Validator;
 use protovalidate_buffa_reflect_conformance::cases::buf::validate::conformance::cases::{
@@ -34,7 +38,7 @@ fn summary(result: Result<(), ValidationError>) -> Vec<String> {
 
 fn agree<M>(json: &str)
 where
-    M: Message + ReflectMessage + Validate + Default,
+    M: Message + ReflectMessage + Validate + Default + HasMessageView,
 {
     let pool = c::__buffa::reflect::descriptor_pool();
     let idx = pool
@@ -46,8 +50,12 @@ where
     let generated = summary(typed.validate());
     let typed = summary(validator.validate(&typed));
     let encoded = summary(validator.validate_encoded(pool, idx, &dynamic.encode_to_vec()));
+    let view = OwnedView::<M::View<'static>>::decode(Bytes::from(dynamic.encode_to_vec()))
+        .expect("decodes");
+    let viewed = summary(validator.validate_view(&view));
     assert_eq!(typed, generated, "{json}");
     assert_eq!(encoded, generated, "{json}");
+    assert_eq!(viewed, generated, "{json}");
 }
 
 /// Validating `bytes` agrees with decoding them and validating the decoded

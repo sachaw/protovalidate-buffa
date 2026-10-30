@@ -10,8 +10,8 @@ use crate::{
         Clock, Outcome,
         value::{self, Gathered, List, Map, Msg, Prim, Value},
     },
-    plan::{Check, Elem, MessagePlan, Plans, Route, Rule, ValuePlan},
-    wire::{self, Card, Found, Kind, Malformed, Raw},
+    plan::{Check, Elem, FieldPlan, MessagePlan, Op, Plans, Route, Rule, ValuePlan},
+    wire::{self, Card, Found, Malformed, Raw},
 };
 
 /// Why a validation stopped before it finished.
@@ -34,6 +34,8 @@ enum Sub<'k, 'a> {
     None,
     Index(usize),
     Key(&'k Value<'a>),
+    /// A map key read off the wire.
+    Prim(Prim<'a>),
 }
 
 /// The rule a violation reports.
@@ -207,58 +209,56 @@ impl<'a> Walker<'a> {
             if let Some(e) = &field.error {
                 return Err(Box::new(Abort::Compile(e.clone())));
             }
-            let present = present(&self.found, field.slot);
             let found = self.found[base + field.slot];
             let here = Path {
                 parent: path,
                 elem: &field.elem,
                 sub: Sub::None,
             };
-            if field.required && !present {
-                self.report(
-                    Some(&here),
-                    None,
-                    RulePath::Required,
-                    "required",
-                    "value is required".into(),
-                    false,
-                );
-                continue;
+            match field.op {
+                Op::Prim(s, explicit) => {
+                    let raw = found.last(&msg.src);
+                    let p = raw.map_or_else(|| value::zero(s), |raw| value::prim(raw, s));
+                    let present = raw.is_some() && (explicit || !p.is_zero());
+                    if self.absent(field, present, &here) {
+                        continue;
+                    }
+                    self.prim(&field.value, p, &here, false)?;
+                }
+                Op::Time(w) => {
+                    if self.absent(field, found.last.is_some(), &here) {
+                        continue;
+                    }
+                    let read = &plan.slots[field.slot].read;
+                    let src = found.message(&msg.src, read.shape.number);
+                    match value::time(&src, w) {
+                        Some(p) => self.prim(&field.value, p, &here, false)?,
+                        None => {
+                            let value = value::message_as(Msg::new(src, msg.index, pool), Some(w));
+                            self.value(&field.value, &value, &here, false)?;
+                        }
+                    }
+                }
+                Op::Message(child, index) => {
+                    if self.absent(field, found.last.is_some(), &here) {
+                        continue;
+                    }
+                    let read = &plan.slots[field.slot].read;
+                    let src = found.message(&msg.src, read.shape.number);
+                    self.message(child, &Msg::new(src, index, pool), Some(&here))?;
+                }
+                Op::Value => {
+                    if self.absent(field, present(&self.found, field.slot), &here) {
+                        continue;
+                    }
+                    let read = &plan.slots[field.slot].read;
+                    let value = match read.shape.card {
+                        Card::Singular => value::singular(&found, &msg.src, read, pool),
+                        _ => Msg::new(msg.src.within(found.span), msg.index, pool).read(read),
+                    };
+                    self.value(&field.value, &value, &here, false)?;
+                }
             }
-            if field.skip_unset && !present {
-                continue;
-            }
-            let read = &plan.slots[field.slot].read;
-            // A message field whose only rules are its type's own needs no
-            // value, only its message.
-            if let (Some(child), Kind::Message(index), None, true) = (
-                field.value.message,
-                read.shape.kind,
-                read.wkt,
-                read.shape.card == Card::Singular && field.value.only_message(),
-            ) {
-                let src = found.message(&msg.src, read.shape.number);
-                self.message(child, &Msg::new(src, index, pool), Some(&here))?;
-                continue;
-            }
-            if let (true, Card::Singular, Kind::Scalar(_) | Kind::Enum(_)) =
-                (field.value.prim, read.shape.card, read.shape.kind)
-            {
-                let s = match read.shape.kind {
-                    Kind::Scalar(s) => s,
-                    _ => ScalarType::Int32,
-                };
-                let p = found
-                    .last(&msg.src)
-                    .map_or_else(|| value::zero(s), |raw| value::prim(raw, s));
-                self.prim(&field.value, p, &here, false)?;
-                continue;
-            }
-            let value = match read.shape.card {
-                Card::Singular => value::singular(&found, &msg.src, read, pool),
-                _ => Msg::new(msg.src.within(found.span), msg.index, pool).read(read),
-            };
-            self.value(&field.value, &value, &here, false)?;
         }
         self.depth -= 1;
         Ok(())
@@ -325,6 +325,26 @@ impl<'a> Walker<'a> {
             self.entries(&entries.0, &entries.1, map, path)?;
         }
         Ok(())
+    }
+
+    /// Whether an unset field is done with: reported as required, or
+    /// skipped.
+    fn absent(&mut self, field: &FieldPlan, present: bool, here: &Path<'_, 'a>) -> bool {
+        if present {
+            return false;
+        }
+        if field.required {
+            self.report(
+                Some(here),
+                None,
+                RulePath::Required,
+                "required",
+                "value is required".into(),
+                false,
+            );
+            return true;
+        }
+        field.skip_unset
     }
 
     /// [`value`](Self::value), for a plan whose checks all run on scalars.
@@ -440,6 +460,22 @@ impl<'a> Walker<'a> {
         path: &Path<'_, 'a>,
     ) -> Result<(), Box<Abort>> {
         let mut result = Ok(());
+        if keys.prim
+            && values.prim
+            && map.prims(&mut |k, v| {
+                let here = Path {
+                    parent: path.parent,
+                    elem: path.elem,
+                    sub: Sub::Prim(k),
+                };
+                result = self
+                    .prim(keys, k, &here, true)
+                    .and_then(|()| self.prim(values, v, &here, false));
+                result.is_ok()
+            })
+        {
+            return result;
+        }
         map.for_each(&mut |k, v| {
             let here = Path {
                 parent: path.parent,
@@ -503,6 +539,16 @@ fn failure<'a>(rule: &'a Rule, v: &Value<'a>, clock: &Clock) -> String {
     }
 }
 
+fn subscript(k: &Value<'_>) -> Option<Subscript> {
+    match k {
+        Value::Bool(b) => Some(Subscript::BoolKey(*b)),
+        Value::Int(i) => Some(Subscript::IntKey(*i)),
+        Value::Uint(u) => Some(Subscript::UintKey(*u)),
+        Value::String(s) => Some(Subscript::StringKey(Cow::Owned(s.to_string()))),
+        _ => None,
+    }
+}
+
 fn field_element(p: &Path<'_, '_>) -> FieldPathElement {
     let e = p.elem;
     let (key_type, value_type, subscript) = match &p.sub {
@@ -511,13 +557,12 @@ fn field_element(p: &Path<'_, '_>) -> FieldPathElement {
         Sub::Key(k) => (
             e.entry.map(|(k, _)| k),
             e.entry.map(|(_, v)| v),
-            match k {
-                Value::Bool(b) => Some(Subscript::BoolKey(*b)),
-                Value::Int(i) => Some(Subscript::IntKey(*i)),
-                Value::Uint(u) => Some(Subscript::UintKey(*u)),
-                Value::String(s) => Some(Subscript::StringKey(Cow::Owned(s.to_string()))),
-                _ => None,
-            },
+            subscript(k),
+        ),
+        Sub::Prim(k) => (
+            e.entry.map(|(k, _)| k),
+            e.entry.map(|(_, v)| v),
+            subscript(&k.value()),
         ),
     };
     FieldPathElement {

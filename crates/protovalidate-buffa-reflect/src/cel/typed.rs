@@ -78,8 +78,8 @@ pub fn compile(p: &Pred, this: &Ty) -> Option<Test> {
                 (Of::Uint, &Const::Uint(k)) => ordered(uint(x)?, op, k),
                 (Of::Double, &Const::Double(k)) => ordered(double(x)?, op, k),
                 (Of::Bool, &Const::Bool(k)) => ordered(boolean(x)?, op, k),
-                (Of::Duration, &Const::Duration(k)) => ordered(duration(x)?, op, k),
-                (Of::Timestamp, &Const::Timestamp(k)) => ordered(timestamp(x)?, op, k),
+                (Of::Duration, &Const::Duration(k)) => ordered(duration(x)?, op, span(k)),
+                (Of::Timestamp, &Const::Timestamp(k)) => ordered(timestamp(x)?, op, instant(k)?),
                 (Of::Str, Const::String(k)) => {
                     let (get, k) = (string(x)?, k.clone());
                     Box::new(move |v, c| Some(decide(op, Some((*get(v, c)?).cmp(&*k)))))
@@ -176,11 +176,11 @@ pub fn compile(p: &Pred, this: &Ty) -> Option<Test> {
                 _ => None,
             })?,
             Of::Duration => within(duration(x)?, items, |c| match *c {
-                Const::Duration(d) => Some(d),
+                Const::Duration(d) => Some(span(d)),
                 _ => None,
             })?,
             Of::Timestamp => within(timestamp(x)?, items, |c| match *c {
-                Const::Timestamp(t) => Some(t),
+                Const::Timestamp(t) => instant(t),
                 _ => None,
             })?,
             Of::Str => {
@@ -569,18 +569,50 @@ fn boolean(x: &Operand) -> Option<Get<bool>> {
     })
 }
 
-fn duration(x: &Operand) -> Option<Get<TimeDelta>> {
+/// A `Duration` in nanoseconds, which orders as the duration does.
+fn span(d: TimeDelta) -> i128 {
+    i128::from(d.num_seconds()) * 1_000_000_000 + i128::from(d.subsec_nanos())
+}
+
+/// A `Timestamp` in nanoseconds since the epoch, which orders as the
+/// timestamp does, short of a leap second.
+fn instant(t: DateTime<Utc>) -> Option<i128> {
+    let n = t.timestamp_subsec_nanos();
+    (n < 1_000_000_000).then(|| i128::from(t.timestamp()) * 1_000_000_000 + i128::from(n))
+}
+
+fn nanos(s: i64, n: i64) -> i128 {
+    i128::from(s) * 1_000_000_000 + i128::from(n)
+}
+
+/// Reads a `Duration` operand, in nanoseconds.
+fn duration(x: &Operand) -> Option<Get<i128>> {
+    if let (Base::This, [], Conv::None) = (x.base, &*x.path, x.conv) {
+        return Some(Box::new(|v, _| match v {
+            Arg::Prim(Prim::Duration(s, n)) => Some(nanos(s, i64::from(n))),
+            Arg::Value(Value::Duration(d)) => Some(span(*d)),
+            _ => None,
+        }));
+    }
     let get = value(x)?;
     Some(Box::new(move |v, c| match get(v, c)? {
-        Value::Duration(d) => Some(d),
+        Value::Duration(d) => Some(span(d)),
         _ => None,
     }))
 }
 
-fn timestamp(x: &Operand) -> Option<Get<DateTime<Utc>>> {
+/// Reads a `Timestamp` operand, in nanoseconds since the epoch.
+fn timestamp(x: &Operand) -> Option<Get<i128>> {
+    if let (Base::This, [], Conv::None) = (x.base, &*x.path, x.conv) {
+        return Some(Box::new(|v, _| match v {
+            Arg::Prim(Prim::Timestamp(s, n)) => Some(nanos(s, i64::from(n))),
+            Arg::Value(Value::Timestamp(t)) => instant(*t),
+            _ => None,
+        }));
+    }
     let get = value(x)?;
     Some(Box::new(move |v, c| match get(v, c)? {
-        Value::Timestamp(t) => Some(t),
+        Value::Timestamp(t) => instant(t),
         _ => None,
     }))
 }

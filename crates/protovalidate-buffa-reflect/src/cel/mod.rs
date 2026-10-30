@@ -123,7 +123,14 @@ impl Program {
                             && check.pred.this_only()
                             && matches!(
                                 bindings.this,
-                                Ty::Int | Ty::Uint | Ty::Double | Ty::Bool | Ty::String | Ty::Bytes
+                                Ty::Int
+                                    | Ty::Uint
+                                    | Ty::Double
+                                    | Ty::Bool
+                                    | Ty::String
+                                    | Ty::Bytes
+                                    | Ty::Duration
+                                    | Ty::Timestamp
                             );
                         Kind::Check(check)
                     }),

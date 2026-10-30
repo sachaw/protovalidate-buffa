@@ -53,7 +53,10 @@ use std::{
     },
 };
 
-use buffa::Message;
+use buffa::{
+    DefaultInstance, Message,
+    view::{MessageView, OwnedView},
+};
 use buffa_descriptor::{DescriptorPool, MessageDescriptor, MessageIndex, reflect::ReflectMessage};
 #[cfg(feature = "connect")]
 pub use connect::ValidateInterceptor;
@@ -141,6 +144,25 @@ impl Validator {
         self.with_cache(md, message.pool(), |plans, scratch| {
             encode(scratch.buffer);
             run(plans, scratch.buffer, scratch.spare)
+        })
+        .map_err(|f| (*f).into_error(md))
+    }
+
+    /// Validates a message held as a view, through the bytes the view was
+    /// decoded from: no encoding, nothing decoded again.
+    ///
+    /// # Errors
+    ///
+    /// As [`validate`](Self::validate).
+    pub fn validate_view<V>(&self, view: &OwnedView<V>) -> Result<(), ValidationError>
+    where
+        V: MessageView<'static>,
+        V::Owned: ReflectMessage,
+    {
+        let message = V::Owned::default_instance();
+        let md = message.message_descriptor();
+        self.with_cache(md, message.pool(), |plans, scratch| {
+            run(plans, view.bytes(), scratch.spare)
         })
         .map_err(|f| (*f).into_error(md))
     }

@@ -82,6 +82,7 @@ pub struct MessageOneof {
 pub struct FieldPlan {
     /// The field's index while planning, and its slot once laid out.
     pub slot: usize,
+    pub op: Op,
     pub elem: Elem,
     pub required: bool,
     /// Unset fields are skipped: the field tracks presence, or the rules
@@ -89,6 +90,21 @@ pub struct FieldPlan {
     pub skip_unset: bool,
     pub error: Option<String>,
     pub value: ValuePlan,
+}
+
+/// How a walk checks a field, worked out once its plan is laid out.
+#[derive(Clone, Copy)]
+pub enum Op {
+    /// A singular scalar (an enum as an int32) whose checks all run on the
+    /// scalar read off the wire; with whether it has explicit presence.
+    Prim(ScalarType, bool),
+    /// A singular `Timestamp` or `Duration` whose checks all run on its
+    /// seconds and nanoseconds read off the wire.
+    Time(Wkt),
+    /// A singular message checked by its type's rules alone: its plan.
+    Message(usize, MessageIndex),
+    /// Anything else, read as a CEL value.
+    Value,
 }
 
 #[derive(Default)]
@@ -455,6 +471,7 @@ impl<'p> Builder<'p> {
         };
         Some(FieldPlan {
             slot: index,
+            op: Op::Value,
             elem: elem(fd, None),
             required: rules.is_some_and(|r| get_bool(r, "required")),
             skip_unset: presence || ignore == IGNORE_IF_ZERO_VALUE,
@@ -1030,8 +1047,26 @@ fn layout(plan: &mut MessagePlan, md: &MessageDescriptor, pool: &DescriptorPool)
         by_field[f].expect("just given a slot")
     };
     for field in &mut plan.fields {
+        let read = Read::of(md, &md.fields()[field.slot], pool);
         field.slot = slot(field.slot, &mut by_field);
         mark_prim(&mut field.value);
+        field.op = match (read.shape.card, read.shape.kind, read.wkt) {
+            (Card::Singular, Kind::Scalar(s), _) if field.value.prim => {
+                Op::Prim(s, read.shape.explicit)
+            }
+            (Card::Singular, Kind::Enum(_), _) if field.value.prim => {
+                Op::Prim(ScalarType::Int32, read.shape.explicit)
+            }
+            (Card::Singular, Kind::Message(_), Some(w @ (Wkt::Timestamp | Wkt::Duration)))
+                if field.value.prim =>
+            {
+                Op::Time(w)
+            }
+            (Card::Singular, Kind::Message(m), None) if field.value.only_message() => {
+                Op::Message(field.value.message.unwrap_or_default(), m)
+            }
+            _ => Op::Value,
+        };
     }
     let mut read = Vec::new();
     for rule in &plan.rules {

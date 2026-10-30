@@ -5,7 +5,12 @@
 //! Values an expression builds (concatenations, `map()` results) are
 //! reference counted.
 
-use std::{cmp::Ordering, fmt, rc::Rc, sync::Arc};
+use std::{
+    cmp::Ordering,
+    fmt,
+    rc::Rc,
+    sync::{Arc, LazyLock},
+};
 
 use buffa_descriptor::{
     DescriptorPool, FieldDescriptor, FieldKind, MessageDescriptor, MessageIndex, ScalarType,
@@ -412,7 +417,7 @@ pub fn element<'a>(
 }
 
 /// A scalar occurrence's value, before it is a CEL value.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum Prim<'a> {
     Int(i64),
     Uint(u64),
@@ -421,6 +426,11 @@ pub enum Prim<'a> {
     /// A string's bytes, which a valid encoding holds as UTF-8.
     Str(&'a [u8]),
     Bytes(&'a [u8]),
+    /// A `Timestamp`'s seconds and nanoseconds, within CEL's range and short
+    /// of a leap second.
+    Timestamp(i64, u32),
+    /// A `Duration`'s seconds and nanoseconds, within CEL's range.
+    Duration(i64, i32),
 }
 
 /// Decodes a scalar occurrence.
@@ -481,6 +491,8 @@ impl<'a> Prim<'a> {
             Self::Str(b) | Self::Bytes(b) => b.iter().fold(0xcbf2_9ce4_8422_2325, |h, &c| {
                 (h ^ u64::from(c)).wrapping_mul(0x100_0000_01b3)
             }),
+            Self::Timestamp(s, n) => s.cast_unsigned() ^ u64::from(n),
+            Self::Duration(s, n) => s.cast_unsigned() ^ u64::from(n.cast_unsigned()),
         }
     }
 
@@ -492,6 +504,8 @@ impl<'a> Prim<'a> {
             Self::Double(d) => d == 0.0,
             Self::Bool(b) => !b,
             Self::Str(b) | Self::Bytes(b) => b.is_empty(),
+            Self::Timestamp(s, n) => s == 0 && n == 0,
+            Self::Duration(s, n) => s == 0 && n == 0,
         }
     }
 
@@ -504,7 +518,41 @@ impl<'a> Prim<'a> {
             Self::Bool(b) => Value::Bool(b),
             Self::Str(b) => Value::String(utf8(b)),
             Self::Bytes(b) => Value::Bytes(Bin::Ref(b)),
+            Self::Timestamp(s, n) => {
+                DateTime::from_timestamp(s, n).map_or(Value::Null, Value::Timestamp)
+            }
+            Self::Duration(s, n) => duration(s, i64::from(n)).map_or(Value::Null, Value::Duration),
         }
+    }
+}
+
+/// A `Duration` as CEL holds it, if it is within CEL's range.
+fn duration(s: i64, n: i64) -> Option<TimeDelta> {
+    TimeDelta::try_seconds(s)?.checked_add(&TimeDelta::nanoseconds(n))
+}
+
+/// A `Timestamp` or `Duration` read off the wire, when it is one a
+/// [`Prim`] holds; `None` for one only a CEL value holds.
+pub fn time<'a>(src: &Src<'_>, w: Wkt) -> Option<Prim<'a>> {
+    let (s, n) = seconds_nanos(src)?;
+    match w {
+        Wkt::Timestamp => {
+            static RANGE: LazyLock<(i64, i64)> = LazyLock::new(|| {
+                (
+                    DateTime::<Utc>::MIN_UTC.timestamp(),
+                    DateTime::<Utc>::MAX_UTC.timestamp(),
+                )
+            });
+            let n = u32::try_from(n).ok().filter(|&n| n < 1_000_000_000)?;
+            (RANGE.0..=RANGE.1)
+                .contains(&s)
+                .then_some(Prim::Timestamp(s, n))
+        }
+        Wkt::Duration => {
+            duration(s, n)?;
+            Some(Prim::Duration(s, i32::try_from(n).ok()?))
+        }
+        _ => None,
     }
 }
 
@@ -553,17 +601,15 @@ pub fn wkt(md: &MessageDescriptor) -> Option<Wkt> {
 /// A message as CEL sees it: well-known types become their CEL values.
 pub fn message_as(m: Msg<'_>, w: Option<Wkt>) -> Value<'_> {
     match w {
-        Some(Wkt::Timestamp) => match seconds_nanos(&m) {
+        Some(Wkt::Timestamp) => match seconds_nanos(&m.src) {
             Some((s, n)) => u32::try_from(n)
                 .ok()
                 .and_then(|n| DateTime::from_timestamp(s, n))
                 .map_or(Value::Message(m), Value::Timestamp),
             None => Value::Message(m),
         },
-        Some(Wkt::Duration) => match seconds_nanos(&m) {
-            Some((s, n)) => TimeDelta::try_seconds(s)
-                .and_then(|d| d.checked_add(&TimeDelta::nanoseconds(n)))
-                .map_or(Value::Message(m), Value::Duration),
+        Some(Wkt::Duration) => match seconds_nanos(&m.src) {
+            Some((s, n)) => duration(s, n).map_or(Value::Message(m), Value::Duration),
             None => Value::Message(m),
         },
         Some(Wkt::Wrapper) => wrapped(&m),
@@ -591,18 +637,17 @@ fn wrapped<'a>(m: &Msg<'a>) -> Value<'a> {
 /// = 2`.
 #[expect(clippy::cast_possible_truncation, reason = "the wire's truncations")]
 #[expect(clippy::cast_possible_wrap, reason = "the wire's reinterpretations")]
-fn seconds_nanos(m: &Msg<'_>) -> Option<(i64, i64)> {
+fn seconds_nanos(src: &Src<'_>) -> Option<(i64, i64)> {
     let (mut s, mut n) = (0, 0);
-    m.src
-        .visit(&mut |number, raw| {
-            match (number, raw) {
-                (1, Raw::Varint(v)) => s = v as i64,
-                (2, Raw::Varint(v)) => n = i64::from(v as i32),
-                _ => {}
-            }
-            Ok::<(), wire::Malformed>(())
-        })
-        .ok()?;
+    src.visit(&mut |number, raw| {
+        match (number, raw) {
+            (1, Raw::Varint(v)) => s = v as i64,
+            (2, Raw::Varint(v)) => n = i64::from(v as i32),
+            _ => {}
+        }
+        Ok::<(), wire::Malformed>(())
+    })
+    .ok()?;
     Some((s, n))
 }
 
@@ -632,6 +677,122 @@ impl<'a> Field<'a> {
 
     /// Visits each entry whose key no later entry repeats: the entries a
     /// decoder keeps.
+    /// [`List::prims`] of `Timestamp`s or `Duration`s, when every item is
+    /// one a [`Prim`] holds.
+    fn times(&self, w: Wkt, f: &mut dyn FnMut(Prim<'a>) -> bool) -> bool {
+        let item = |raw: Raw<'a>| match raw {
+            Raw::Len(b) | Raw::Group(b) => time(&Src::Bytes(b), w),
+            _ => None,
+        };
+        let mut all = true;
+        let _ = wire::elements(&self.src, self.number, self.kind, self.pool, &mut |raw| {
+            all = item(raw).is_some();
+            all
+        });
+        if !all {
+            return false;
+        }
+        let _ = wire::elements(&self.src, self.number, self.kind, self.pool, &mut |raw| {
+            item(raw).is_some_and(|p| f(p))
+        });
+        true
+    }
+
+    /// Whether a key may repeat. Keys are hashed into a small filter; only a
+    /// possible repeat sorts the entries, as a key a decoder sees twice keeps
+    /// its last entry.
+    fn repeats(&self, key: ScalarType) -> bool {
+        let mut filter = [0u64; 4];
+        let mut repeats = false;
+        let _ = wire::entries(
+            &self.src,
+            self.number,
+            key,
+            self.kind,
+            self.pool,
+            &mut |e| {
+                let h = e
+                    .key
+                    .map_or_else(|| zero(key), |k| prim(k, key))
+                    .hash()
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let (word, bit) = ((h >> 62) as usize, 1 << ((h >> 56) & 63));
+                repeats = filter[word] & bit != 0;
+                filter[word] |= bit;
+                !repeats
+            },
+        );
+        repeats
+    }
+
+    /// Visits a scalar-valued map's entries as the scalars read off the
+    /// wire, until `f` returns false; false, visiting nothing, for another
+    /// map or one whose keys may repeat.
+    fn prim_entries(&self, f: &mut dyn FnMut(Prim<'a>, Prim<'a>) -> bool) -> bool {
+        let Card::Map(key) = self.card else {
+            return false;
+        };
+        let value = match self.kind {
+            Kind::Scalar(s) => s,
+            Kind::Enum(_) => ScalarType::Int32,
+            Kind::Message(_) => return false,
+        };
+        let entry = |e: &wire::Entry<'a>| {
+            (
+                e.key.map_or_else(|| zero(key), |r| prim(r, key)),
+                e.value
+                    .last(&e.src)
+                    .map_or_else(|| zero(value), |r| prim(r, value)),
+            )
+        };
+        // A few entries are read in one pass and their keys compared
+        // pairwise; more are first checked for a key that may repeat.
+        const SMALL: usize = 8;
+        let mut small = [(Prim::Int(0), Prim::Int(0)); SMALL];
+        let mut n = 0;
+        let _ = wire::entries(
+            &self.src,
+            self.number,
+            key,
+            self.kind,
+            self.pool,
+            &mut |e| {
+                if let Some(slot) = small.get_mut(n) {
+                    *slot = entry(e);
+                }
+                n += 1;
+                n <= SMALL
+            },
+        );
+        if n <= SMALL {
+            let small = &small[..n];
+            for (i, &(k, v)) in small.iter().enumerate() {
+                if small[i + 1..].iter().any(|(later, _)| *later == k) {
+                    continue;
+                }
+                if !f(k, v) {
+                    break;
+                }
+            }
+            return true;
+        }
+        if self.repeats(key) {
+            return false;
+        }
+        let _ = wire::entries(
+            &self.src,
+            self.number,
+            key,
+            self.kind,
+            self.pool,
+            &mut |e| {
+                let (k, v) = entry(e);
+                f(k, v)
+            },
+        );
+        true
+    }
+
     fn entries(&self, f: &mut dyn FnMut(Value<'a>, Value<'a>) -> bool) {
         let Card::Map(key) = self.card else {
             return;
@@ -646,21 +807,7 @@ impl<'a> Field<'a> {
         };
         let value_of = |e: &wire::Entry<'a>| singular(&e.value, &e.src, &value_read, self.pool);
         let (number, kind) = (self.number, self.kind);
-        // A key a decoder sees twice keeps its last entry. Keys are hashed
-        // into a small filter; only a possible repeat sorts the entries.
-        let mut filter = [0u64; 4];
-        let mut repeats = false;
-        let _ = wire::entries(&self.src, number, key, kind, self.pool, &mut |e| {
-            let h = e
-                .key
-                .map_or_else(|| zero(key), |k| prim(k, key))
-                .hash()
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            let (word, bit) = ((h >> 62) as usize, 1 << ((h >> 56) & 63));
-            repeats = filter[word] & bit != 0;
-            filter[word] |= bit;
-            !repeats
-        });
+        let repeats = self.repeats(key);
         if !repeats {
             let _ = wire::entries(&self.src, number, key, kind, self.pool, &mut |e| {
                 f(key_of(e), value_of(e))
@@ -741,10 +888,13 @@ impl<'a> List<'a> {
         let Self::Field(field) = self else {
             return false;
         };
-        let s = match field.kind {
-            Kind::Scalar(s) => s,
-            Kind::Enum(_) => ScalarType::Int32,
-            Kind::Message(_) => return false,
+        let s = match (field.kind, field.wkt) {
+            (Kind::Scalar(s), _) => s,
+            (Kind::Enum(_), _) => ScalarType::Int32,
+            (Kind::Message(_), Some(w @ (Wkt::Timestamp | Wkt::Duration))) => {
+                return field.times(w, f);
+            }
+            (Kind::Message(_), _) => return false,
         };
         let _ = wire::elements(
             &field.src,
@@ -779,6 +929,14 @@ impl<'a> List<'a> {
 }
 
 impl<'a> Map<'a> {
+    /// [`Field::prim_entries`], for a map field.
+    pub fn prims(&self, f: &mut dyn FnMut(Prim<'a>, Prim<'a>) -> bool) -> bool {
+        match self {
+            Self::Field(field) => field.prim_entries(f),
+            _ => false,
+        }
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Self::Field(_) => {
