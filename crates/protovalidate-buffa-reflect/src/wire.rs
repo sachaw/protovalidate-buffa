@@ -202,7 +202,7 @@ impl<'a> Src<'a> {
             Self::Bytes(b) => b.to_vec(),
             Self::Merged(m) => {
                 let mut out = Vec::new();
-                let _ = m.chunks(&mut |c| {
+                let _ = m.chunks(&mut |c, _| {
                     out.extend_from_slice(c);
                     Ok::<(), Malformed>(())
                 });
@@ -213,20 +213,25 @@ impl<'a> Src<'a> {
 }
 
 impl<'a> Merged<'a> {
+    /// Visits the occurrences that merge, each with where its contents sit
+    /// in the base bytes.
     fn chunks<E: From<Malformed>>(
         &self,
-        f: &mut dyn FnMut(&'a [u8]) -> Result<(), E>,
+        f: &mut dyn FnMut(&'a [u8], usize) -> Result<(), E>,
     ) -> Result<(), E> {
         let mut seen = 0;
-        self.parent.visit(&mut |n, raw| {
-            if n != self.number {
-                return Ok(());
-            }
-            let (Raw::Len(chunk) | Raw::Group(chunk)) = raw else {
+        self.parent.visit_at(&mut |n, raw, at| {
+            let (true, Some(span), Raw::Len(chunk) | Raw::Group(chunk)) =
+                (n == self.number, payload(raw, &at, n), raw)
+            else {
                 return Ok(());
             };
             seen += 1;
-            if seen > self.skip { f(chunk) } else { Ok(()) }
+            if seen > self.skip {
+                f(chunk, span.start)
+            } else {
+                Ok(())
+            }
         })
     }
 
@@ -234,24 +239,9 @@ impl<'a> Merged<'a> {
         &self,
         f: &mut dyn FnMut(u32, Raw<'a>, Range<usize>) -> Result<(), E>,
     ) -> Result<(), E> {
-        let mut seen = 0;
-        self.parent.visit_at(&mut |n, raw, at| {
-            if n != self.number {
-                return Ok(());
-            }
-            let Some(chunk) = payload(raw, &at, n) else {
-                return Ok(());
-            };
-            seen += 1;
-            if seen <= self.skip {
-                return Ok(());
-            }
-            let (Raw::Len(bytes) | Raw::Group(bytes)) = raw else {
-                return Ok(());
-            };
-            Src::Bytes(bytes).visit_at(&mut |n, raw, inner| {
-                f(n, raw, chunk.start + inner.start..chunk.start + inner.end)
-            })
+        self.chunks(&mut |chunk, start| {
+            Src::Bytes(chunk)
+                .visit_at(&mut |n, raw, at| f(n, raw, start + at.start..start + at.end))
         })
     }
 }
