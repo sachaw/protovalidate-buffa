@@ -2557,6 +2557,18 @@ impl<'a> Compiler<'a> {
         })
     }
 
+    /// `ty` with a message reference resolved to its schema, so an indexed
+    /// element or value reads like any message.
+    fn resolve_message(&self, ty: &CelType) -> CelType {
+        match ty {
+            CelType::MessageRef(fqn) => self
+                .schemas
+                .and_then(|s| s.get(fqn))
+                .map_or_else(|| ty.clone(), |schema| CelType::Message(Box::new(schema))),
+            _ => ty.clone(),
+        }
+    }
+
     fn op_index(&mut self, args: &[IdedExpr]) -> Result<Compiled, FallbackReason> {
         if args.len() != 2 {
             return Err(FallbackReason::new("index arity"));
@@ -2571,6 +2583,7 @@ impl<'a> Compiler<'a> {
                     key_rust,
                     value_rust,
                 } = map_ty.as_ref();
+                let val_ty = &self.resolve_message(val_ty);
                 let key_t = coerce(&key, key_cel)?;
                 // For String / Bytes keys the HashMap stores `String` /
                 // `Vec<u8>` and `.get` accepts `&str` / `&[u8]` directly
@@ -2642,7 +2655,7 @@ impl<'a> Compiler<'a> {
                 let lookup = quote! {
                     (#op_t).get(::core::convert::TryFrom::try_from(#key_t).unwrap_or(usize::MAX))
                 };
-                let (value, ty) = match elem_ty.as_ref() {
+                let (value, ty) = match &self.resolve_message(elem_ty) {
                     CelType::Str { .. } => (
                         quote! { #lookup.map(|__v| ::core::convert::AsRef::<str>::as_ref(__v)) },
                         CelType::Str { owned: false },
@@ -2717,6 +2730,7 @@ impl<'a> Compiler<'a> {
                     key_rust,
                     value_rust,
                 } = map_ty.as_ref();
+                let val_ty = &self.resolve_message(val_ty);
                 let key_t = coerce(&key, key_cel)?;
                 let key_lookup_raw = cast_to_rust_scalar(&key_t, key_cel, *key_rust);
                 let key_lookup = if matches!(key_rust, RustScalar::Str | RustScalar::Bytes) {
@@ -2767,6 +2781,10 @@ impl<'a> Compiler<'a> {
                         quote! { ((#op_t).get(#key_lookup).copied()) },
                         CelType::Bool,
                     ),
+                    CelType::Message(schema) => (
+                        quote! { ((#op_t).get(#key_lookup)) },
+                        CelType::Message(schema.clone()),
+                    ),
                     other => {
                         return Err(FallbackReason::new(format!(
                             "opt_index on map<_, {other:?}>"
@@ -2782,8 +2800,11 @@ impl<'a> Compiler<'a> {
             CelType::List(elem_ty) => {
                 let key_t = coerce(&key, &CelType::Int)?;
                 let op_t = operand.tokens;
-                let idx_t = quote! { ((#key_t) as usize) };
-                let (tokens, owned_ty) = match elem_ty.as_ref() {
+                // A negative index converts to `usize::MAX`, so it misses.
+                let idx_t = quote! {
+                    (::core::convert::TryFrom::try_from(#key_t).unwrap_or(usize::MAX))
+                };
+                let (tokens, owned_ty) = match &self.resolve_message(elem_ty) {
                     // Strings/bytes: borrow, don't clone — see opt_index
                     // map arm above for the rationale.
                     CelType::Str { .. } => (
@@ -2811,6 +2832,15 @@ impl<'a> Compiler<'a> {
                         CelType::Double,
                     ),
                     CelType::Bool => (quote! { ((#op_t).get(#idx_t).copied()) }, CelType::Bool),
+                    CelType::Message(schema) => (
+                        quote! {
+                            ((#op_t).get(#idx_t).map(|__v| {
+                                use ::protovalidate_buffa::__private::Referent as _;
+                                __v.referent()
+                            }))
+                        },
+                        CelType::Message(schema.clone()),
+                    ),
                     other => {
                         return Err(FallbackReason::new(format!("opt_index on list<{other:?}>")));
                     }
@@ -6596,6 +6626,71 @@ mod tests {
             !s.contains("as_option"),
             "field access must not skip unset messages: {s}"
         );
+    }
+
+    #[test]
+    fn indexing_a_list_or_map_of_message_refs_selects_fields() {
+        let item = MessageSchema {
+            fields: vec![MessageFieldEntry {
+                proto_name: "x".to_string(),
+                rust_ident: "x".to_string(),
+                ty: CelType::Int,
+                kind: SchemaFieldKind::Scalar,
+            }],
+            view: false,
+        };
+        let item_ref = || CelType::MessageRef("Item".to_string());
+        let outer = MessageSchema {
+            fields: vec![
+                MessageFieldEntry {
+                    proto_name: "items".to_string(),
+                    rust_ident: "items".to_string(),
+                    ty: CelType::List(Box::new(item_ref())),
+                    kind: SchemaFieldKind::Repeated,
+                },
+                MessageFieldEntry {
+                    proto_name: "picks".to_string(),
+                    rust_ident: "picks".to_string(),
+                    ty: CelType::List(Box::new(CelType::UInt)),
+                    kind: SchemaFieldKind::Repeated,
+                },
+                MessageFieldEntry {
+                    proto_name: "named".to_string(),
+                    rust_ident: "named".to_string(),
+                    ty: CelType::Map(Box::new(MapTy {
+                        key_cel: CelType::Str { owned: false },
+                        value_cel: item_ref(),
+                        key_rust: RustScalar::Str,
+                        value_rust: RustScalar::Message,
+                    })),
+                    kind: SchemaFieldKind::Map,
+                },
+            ],
+            view: false,
+        };
+        let mut index: BTreeMap<String, MessageSchema> = BTreeMap::new();
+        index.insert("Item".to_string(), item);
+        for expr in [
+            "this.items[0].x > 0",
+            "this.picks.all(i, this.items[int(i)].x > 0)",
+            "this.named['k'].x > 0",
+            "this.items[?1].hasValue() && this.items[?1].value().x > 0",
+            "this.named[?'k'].hasValue() && this.named[?'k'].value().x > 0",
+        ] {
+            let mut c = Compiler::new().with_schemas(&index);
+            c.bind(
+                "this",
+                Binding {
+                    rust_expr: quote! { self },
+                    ty: CelType::Message(Box::new(outer.clone())),
+                    constant: None,
+                },
+            );
+            let out = c
+                .compile(expr)
+                .unwrap_or_else(|e| panic!("{expr}: {}", e.message));
+            assert_eq!(out.ty, CelType::Bool, "{expr}");
+        }
     }
 
     // ====================================================================
