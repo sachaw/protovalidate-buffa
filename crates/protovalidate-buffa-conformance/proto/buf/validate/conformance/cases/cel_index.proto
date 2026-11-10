@@ -56,3 +56,43 @@ message CelOptionalValue {
   }];
   Child child = 3;
 }
+
+// A message rule indexes a repeated message field and a map of messages:
+// by a literal, by an index computed in a comprehension, through nested
+// lists, and optionally.
+message CelMessageListIndex {
+  option (buf.validate.message).cel = {
+    id: "list.message_index"
+    expression: "size(this.children) == 0 || this.children[0].id != ''"
+  };
+  option (buf.validate.message).cel = {
+    id: "list.computed_index"
+    expression: "this.picks.all(i, this.children[int(i)].id != 'bad')"
+  };
+  option (buf.validate.message).cel = {
+    id: "list.nested_index"
+    expression: "size(this.children) < 2 || size(this.children[1].children) == 0 || this.children[1].children[0].axis < 3"
+  };
+  option (buf.validate.message).cel = {
+    id: "list.optional_index"
+    expression: "!this.children[?2].hasValue() || this.children[?2].value().id != 'none'"
+  };
+  option (buf.validate.message).cel = {
+    id: "map.message_index"
+    expression: "!('k' in this.named) || this.named['k'].id == 'k'"
+  };
+  option (buf.validate.message).cel = {
+    id: "map.optional_index"
+    expression: "!this.named[?'z'].hasValue() || this.named[?'z'].value().id == 'z'"
+  };
+
+  message Child {
+    string id = 1;
+    repeated Child children = 2;
+    uint32 axis = 3;
+  }
+
+  repeated Child children = 1;
+  repeated uint32 picks = 2;
+  map<string, Child> named = 3;
+}
